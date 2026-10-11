@@ -1,328 +1,584 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="id">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>FB Page Cleaner</title>
-  <script src="https://cdn.tailwindcss.com"></script>
-  <style>
-    .log { font-family: ui-monospace, monospace; font-size: 0.85rem; }
-  </style>
-</head>
-<body class="bg-gray-100 min-h-screen">
-  <div class="max-w-5xl mx-auto p-6">
-    <h1 class="text-2xl font-bold mb-2">Facebook Page Post Cleaner</h1>
-    <p class="text-sm text-gray-600 mb-6">Versi lokal aman. Token hanya hidup di memory server ini.</p>
-
-    <!-- Login -->
-    <div id="login-box" class="bg-white rounded-lg shadow p-6 mb-6">
-      <label class="block text-sm font-medium mb-2">User / System User Access Token</label>
-      <textarea id="token" rows="3" class="w-full border rounded p-2 font-mono text-sm" placeholder="Paste token di sini..."></textarea>
-      <button onclick="login()" class="mt-3 bg-blue-600 text-white px-4 py-2 rounded hover:bg-blue-700">Load Pages</button>
-      <div id="login-status" class="mt-2 text-sm"></div>
-    </div>
-
-    <!-- Main -->
-    <div id="main" class="hidden">
-      <div class="bg-white rounded-lg shadow p-6 mb-6">
-        <div class="flex justify-between items-center mb-4">
-          <h2 class="font-semibold">Pilih Page</h2>
-          <button onclick="logout()" class="text-sm text-red-600">Logout</button>
-        </div>
-        <div id="pages" class="space-y-2"></div>
-        <div class="mt-4 flex gap-2 flex-wrap items-center">
-          <input type="number" id="post-limit" value="50" min="10" max="200" class="border rounded px-2 py-1 w-20">
-          <span class="text-sm self-center">maks post per page</span>
-          <input type="date" id="since" class="border rounded px-2 py-1">
-          <span class="text-sm self-center">sejak</span>
-          <button onclick="loadSelectedPages()" class="bg-green-600 text-white px-4 py-1 rounded">Load Posts</button>
-          <button onclick="checkAdsPosts()" class="bg-orange-500 text-white px-4 py-1 rounded text-sm">Cek Postingan Ads</button>
-          <span id="ads-status" class="text-xs text-gray-600"></span>
-        </div>
-      </div>
-
-      <div id="posts-area" class="bg-white rounded-lg shadow p-6 mb-6 hidden">
-        <div class="flex justify-between mb-3">
-          <h2 class="font-semibold">Postingan</h2>
-          <div>
-            <label class="text-sm mr-3"><input type="checkbox" id="dry-run" checked> Dry Run (simulasi)</label>
-            <label class="text-sm mr-2">Delay: <input type="number" id="delay" value="300" min="0" max="60000" class="w-16 border rounded px-1"> ms</label>
-            <label class="text-sm">Paralel: <input type="number" id="concurrency" value="3" min="1" max="5" class="w-12 border rounded px-1" title="Maksimal 5 permintaan bersamaan"></label>
-          </div>
-        </div>
-        <div id="posts" class="max-h-96 overflow-y-auto border rounded p-2 text-sm"></div>
-        <div class="mt-4 flex gap-2">
-          <button onclick="selectAll()" class="text-sm border px-3 py-1 rounded">Pilih Semua</button>
-          <button onclick="deselectAll()" class="text-sm border px-3 py-1 rounded">Hapus Pilihan</button>
-          <button onclick="deleteSelected()" class="bg-red-600 text-white px-4 py-2 rounded">Hapus yang Dipilih</button>
-        </div>
-      </div>
-
-      <div id="log-area" class="bg-gray-900 text-green-400 rounded-lg p-4 log hidden">
-        <div class="mb-3">
-          <div id="progress-text" class="text-sm mb-2">Menunggu proses...</div>
-          <div class="w-full bg-gray-700 rounded-full h-3 overflow-hidden">
-            <div id="progress-bar" class="bg-green-500 h-3 rounded-full" style="width:0%;transition:width .2s ease"></div>
-          </div>
-        </div>
-        <div id="log"></div>
-      </div>
-    </div>
-  </div>
-
-<script>
-let sessionId = null;
-let pageTokens = {};
-let selectedPosts = new Set();
-let protectedPostIds = new Set();
-
-function isProtected(postId) {
-  if (!postId || !protectedPostIds || protectedPostIds.size === 0) return false;
-  const id = String(postId);
-  if (protectedPostIds.has(id)) return true;
-  const parts = id.split('_');
-  if (parts.length >= 2) {
-    const postPart = parts[parts.length - 1];
-    if (protectedPostIds.has(postPart)) return true;
-    // Cek juga full ID yang mungkin beda prefix
-    for (const p of protectedPostIds) {
-      if (String(p).endsWith('_' + postPart) || String(p) === postPart) return true;
-    }
-  }
-  return false;
-}
-
-async function checkAdsPosts() {
-  if (!sessionId) return alert('Login dulu');
-  const status = document.getElementById('ads-status');
-  status.textContent = 'Mengecek iklan...';
-  try {
-    const res = await fetch(`/api/ads-posts/${sessionId}`);
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || 'Error');
-    protectedPostIds = new Set(data.protected_posts || []);
-    console.log('Protected posts loaded:', protectedPostIds.size);
-    console.log('Sample protected:', Array.from(protectedPostIds).slice(0, 10));
-    status.textContent = `Ditemukan ${data.count} postingan dipakai ads (dari ${data.ad_accounts?.length || 0} ad account)`;
-    if (data.warning) status.textContent += ' | Warning: ' + data.warning;
-    // Refresh tampilan jika posts sudah di-load
-    if (document.getElementById('posts').children.length) {
-      markProtectedPosts();
-    }
-  } catch (e) {
-    status.textContent = 'Error cek ads: ' + e.message;
-  }
-}
-
-function markProtectedPosts() {
-  document.querySelectorAll('.post-check').forEach(cb => {
-    const row = cb.closest('label');
-    if (isProtected(cb.value)) {
-      cb.disabled = true;
-      cb.checked = false;
-      row.classList.add('bg-yellow-50', 'border-l-4', 'border-orange-400');
-      if (!row.querySelector('.ads-badge')) {
-        const badge = document.createElement('span');
-        badge.className = 'ads-badge ml-2 px-1.5 py-0.5 bg-orange-500 text-white text-[10px] rounded';
-        badge.textContent = 'ADS';
-        row.querySelector('.font-medium').appendChild(badge);
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>FB Page Cleaner</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+      .log {
+        font-family: ui-monospace, monospace;
+        font-size: 0.85rem;
       }
-    }
-  });
-}
+    </style>
+  </head>
+  <body class="bg-gray-100 min-h-screen">
+    <div class="max-w-5xl mx-auto p-6">
+      <h1 class="text-2xl font-bold mb-2">Facebook Page Post Cleaner</h1>
+      <p class="text-sm text-gray-600 mb-6">
+        Versi lokal aman. Token hanya hidup di memory server ini.
+      </p>
 
-async function login() {
-  const token = document.getElementById('token').value.trim();
-  const status = document.getElementById('login-status');
-  status.textContent = 'Loading...';
-  try {
-    const fd = new FormData();
-    fd.append('token', token);
-    const res = await fetch('/api/login', { method: 'POST', body: fd });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || 'Error');
-    sessionId = data.session_id;
-    pageTokens = {};
-    data.pages.forEach(p => pageTokens[p.id] = null); // will fill later
-    renderPages(data.pages);
-    document.getElementById('login-box').classList.add('hidden');
-    document.getElementById('main').classList.remove('hidden');
-    status.textContent = '';
-  } catch (e) {
-    status.textContent = 'Error: ' + e.message;
-    status.className = 'mt-2 text-sm text-red-600';
-  }
-}
+      <!-- Login -->
+      <div id="login-box" class="bg-white rounded-lg shadow p-6 mb-6">
+        <label class="block text-sm font-medium mb-2"
+          >User / System User Access Token</label
+        >
+        <textarea
+          id="token"
+          rows="3"
+          class="w-full border rounded p-2 font-mono text-sm"
+          placeholder="Paste token di sini..."
+        ></textarea>
+        <button
+          onclick="login()"
+          class="mt-3 bg-blue-600 text-white px-4 py-2 rounded hover:bg-blue-700"
+        >
+          Load Pages
+        </button>
+        <div id="login-status" class="mt-2 text-sm"></div>
+      </div>
 
-function renderPages(pages) {
-  const el = document.getElementById('pages');
-  el.innerHTML = pages.map(p => `
+      <!-- Main -->
+      <div id="main" class="hidden">
+        <div class="bg-white rounded-lg shadow p-6 mb-6">
+          <div class="flex justify-between items-center mb-4">
+            <h2 class="font-semibold">Pilih Page</h2>
+            <button onclick="logout()" class="text-sm text-red-600">
+              Logout
+            </button>
+          </div>
+          <div id="pages" class="space-y-2"></div>
+          <div class="mt-4 flex gap-2 flex-wrap items-center">
+            <input
+              type="number"
+              id="post-limit"
+              value="50"
+              min="1"
+              max="10000"
+              class="border rounded px-2 py-1 w-20"
+            />
+            <span class="text-sm self-center">maks post per page</span>
+            <input type="date" id="since" class="border rounded px-2 py-1" />
+            <span class="text-sm self-center">sejak</span>
+            <button
+              onclick="loadSelectedPages()"
+              class="bg-green-600 text-white px-4 py-1 rounded"
+            >
+              Load Posts
+            </button>
+            <button
+              onclick="checkAdsPosts()"
+              class="bg-orange-500 text-white px-4 py-1 rounded text-sm"
+            >
+              Cek Postingan Ads
+            </button>
+            <span id="ads-status" class="text-xs text-gray-600"></span>
+          </div>
+        </div>
+
+        <div id="posts-area" class="bg-white rounded-lg shadow p-6 mb-6 hidden">
+          <div class="flex justify-between mb-3">
+            <h2 class="font-semibold">Postingan</h2>
+            <div>
+              <label class="text-sm mr-3"
+                ><input type="checkbox" id="dry-run" checked /> Dry Run
+                (simulasi)</label
+              >
+              <label class="text-sm mr-2"
+                >Delay:
+                <input
+                  type="number"
+                  id="delay"
+                  value="300"
+                  min="0"
+                  max="60000"
+                  class="w-16 border rounded px-1"
+                />
+                ms</label
+              >
+              <label class="text-sm"
+                >Paralel:
+                <input
+                  type="number"
+                  id="concurrency"
+                  value="3"
+                  min="1"
+                  max="5"
+                  class="w-12 border rounded px-1"
+                  title="Maksimal 5 permintaan bersamaan"
+              /></label>
+            </div>
+          </div>
+
+          <div
+            id="load-status"
+            class="mb-3 text-sm whitespace-pre-line"
+            role="status"
+            aria-live="polite"
+          ></div>
+          <div
+            id="posts"
+            class="max-h-96 overflow-y-auto border rounded p-2 text-sm"
+          ></div>
+
+          <div class="mt-4 flex gap-2">
+            <button
+              onclick="selectAll()"
+              class="text-sm border px-3 py-1 rounded"
+            >
+              Pilih Semua
+            </button>
+            <button
+              onclick="deselectAll()"
+              class="text-sm border px-3 py-1 rounded"
+            >
+              Hapus Pilihan
+            </button>
+            <button
+              onclick="deleteSelected()"
+              class="bg-red-600 text-white px-4 py-2 rounded"
+            >
+              Hapus yang Dipilih
+            </button>
+          </div>
+        </div>
+
+        <div
+          id="log-area"
+          class="bg-gray-900 text-green-400 rounded-lg p-4 log hidden"
+        >
+          <div class="mb-3">
+            <div id="progress-text" class="text-sm mb-2">
+              Menunggu proses...
+            </div>
+            <div class="w-full bg-gray-700 rounded-full h-3 overflow-hidden">
+              <div
+                id="progress-bar"
+                class="bg-green-500 h-3 rounded-full"
+                style="width: 0%; transition: width 0.2s ease"
+              ></div>
+            </div>
+          </div>
+          <div id="log"></div>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      let sessionId = null;
+      let pageTokens = {};
+      let selectedPosts = new Set();
+      let protectedPostIds = new Set();
+
+      function isProtected(postId) {
+        if (!postId || !protectedPostIds || protectedPostIds.size === 0)
+          return false;
+        const id = String(postId);
+        if (protectedPostIds.has(id)) return true;
+        const parts = id.split("_");
+        if (parts.length >= 2) {
+          const postPart = parts[parts.length - 1];
+          if (protectedPostIds.has(postPart)) return true;
+          // Cek juga full ID yang mungkin beda prefix
+          for (const p of protectedPostIds) {
+            if (String(p).endsWith("_" + postPart) || String(p) === postPart)
+              return true;
+          }
+        }
+        return false;
+      }
+
+      async function checkAdsPosts() {
+        if (!sessionId) return alert("Login dulu");
+        const status = document.getElementById("ads-status");
+        status.textContent = "Mengecek iklan...";
+        try {
+          const res = await fetch(`/api/ads-posts/${sessionId}`);
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.detail || "Error");
+          protectedPostIds = new Set(data.protected_posts || []);
+          console.log("Protected posts loaded:", protectedPostIds.size);
+          console.log(
+            "Sample protected:",
+            Array.from(protectedPostIds).slice(0, 10),
+          );
+          status.textContent = `Ditemukan ${data.count} postingan dipakai ads (dari ${data.ad_accounts?.length || 0} ad account)`;
+          if (data.warning) status.textContent += " | Warning: " + data.warning;
+          // Refresh tampilan jika posts sudah di-load
+          if (document.getElementById("posts").children.length) {
+            markProtectedPosts();
+          }
+        } catch (e) {
+          status.textContent = "Error cek ads: " + e.message;
+        }
+      }
+
+      function markProtectedPosts() {
+        document.querySelectorAll(".post-check").forEach((cb) => {
+          const row = cb.closest("label");
+          if (isProtected(cb.value)) {
+            cb.disabled = true;
+            cb.checked = false;
+            row.classList.add(
+              "bg-yellow-50",
+              "border-l-4",
+              "border-orange-400",
+            );
+            if (!row.querySelector(".ads-badge")) {
+              const badge = document.createElement("span");
+              badge.className =
+                "ads-badge ml-2 px-1.5 py-0.5 bg-orange-500 text-white text-[10px] rounded";
+              badge.textContent = "ADS";
+              row.querySelector(".font-medium").appendChild(badge);
+            }
+          }
+        });
+      }
+
+      async function login() {
+        const token = document.getElementById("token").value.trim();
+        const status = document.getElementById("login-status");
+        status.textContent = "Loading...";
+        try {
+          const fd = new FormData();
+          fd.append("token", token);
+          const res = await fetch("/api/login", { method: "POST", body: fd });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.detail || "Error");
+          sessionId = data.session_id;
+          pageTokens = {};
+          data.pages.forEach((p) => (pageTokens[p.id] = null)); // will fill later
+          renderPages(data.pages);
+          document.getElementById("login-box").classList.add("hidden");
+          document.getElementById("main").classList.remove("hidden");
+          status.textContent = "";
+        } catch (e) {
+          status.textContent = "Error: " + e.message;
+          status.className = "mt-2 text-sm text-red-600";
+        }
+      }
+
+      function renderPages(pages) {
+        const el = document.getElementById("pages");
+        el.innerHTML = pages
+          .map(
+            (p) => `
     <label class="flex items-center gap-2 p-2 border rounded hover:bg-gray-50">
       <input type="checkbox" class="page-check" value="${p.id}" data-name="${p.name}">
       <span class="font-medium">${p.name}</span>
       <span class="text-xs text-gray-500">${p.id}</span>
     </label>
-  `).join('');
-}
-
-async function loadSelectedPages() {
-  const checks = document.querySelectorAll('.page-check:checked');
-  if (!checks.length) return alert('Pilih minimal 1 page');
-  const limit = document.getElementById('post-limit').value;
-  const since = document.getElementById('since').value;
-  const postsEl = document.getElementById('posts');
-  postsEl.innerHTML = '<div class="text-gray-500">Loading posts...</div>';
-  document.getElementById('posts-area').classList.remove('hidden');
-  selectedPosts.clear();
-
-  let allPosts = [];
-  const seenIds = new Set();
-  for (const cb of checks) {
-    const pageId = cb.value;
-    const pageName = cb.dataset.name;
-    const url = `/api/posts/${sessionId}/${pageId}?limit=${limit}${since ? '&since='+since : ''}`;
-    const res = await fetch(url);
-    const data = await res.json();
-    if (!res.ok) {
-      postsEl.innerHTML += `<div class="text-red-600">Error page ${pageName}: ${data.detail}</div>`;
-      continue;
-    }
-    data.posts.forEach(p => {
-      if (seenIds.has(p.id)) return;  // skip duplikat
-      seenIds.add(p.id);
-      p._pageName = pageName;
-      p._pageId = pageId;
-      allPosts.push(p);
-    });
-  }
-
-  console.log('Loaded unique posts:', allPosts.length);
-
-  postsEl.innerHTML = allPosts.map(p => {
-    let thumb = '';
-    let mediaLabel = '';
-
-    // Prioritas thumbnail
-    if (p.full_picture) {
-      thumb = p.full_picture;
-    } else if (p.attachments && p.attachments.data && p.attachments.data[0]) {
-      const att = p.attachments.data[0];
-      if (att.media && att.media.image && att.media.image.src) {
-        thumb = att.media.image.src;
+  `,
+          )
+          .join("");
       }
-      if (att.type) mediaLabel = att.type;
-    }
 
-    const text = (p.message || '').trim() || '(tidak ada caption)';
-    const shortText = text.length > 140 ? text.slice(0, 140) + '…' : text;
-    const protectedFlag = isProtected(p.id);
+      async function loadSelectedPages() {
+        const checks = Array.from(
+          document.querySelectorAll(".page-check:checked"),
+        );
 
-    return `
-      <label class="flex gap-3 py-2 border-b hover:bg-gray-50 text-xs items-start ${protectedFlag ? 'bg-yellow-50 border-l-4 border-orange-400' : ''}">
-        <input type="checkbox" class="post-check mt-1" value="${p.id}" data-page="${p._pageId}" ${protectedFlag ? 'disabled' : ''}>
-        ${thumb ? `<img src="${thumb}" class="w-16 h-16 object-cover rounded flex-shrink-0 bg-gray-200" loading="lazy" onerror="this.style.display='none'">` : '<div class="w-16 h-16 bg-gray-200 rounded flex-shrink-0 flex items-center justify-center text-gray-400 text-[10px]">no img</div>'}
-        <div class="flex-1 min-w-0">
-          <div class="font-medium break-words">${shortText}${protectedFlag ? ' <span class="ads-badge ml-1 px-1.5 py-0.5 bg-orange-500 text-white text-[10px] rounded">ADS</span>' : ''}</div>
-          <div class="text-gray-500 mt-1">
-            ${p.created_time?.slice(0,16).replace('T',' ')} · ${p._pageName}
-            ${mediaLabel ? ` · <span class="text-blue-600">${mediaLabel}</span>` : ''}
-            · <a href="${p.permalink_url}" target="_blank" class="text-blue-600 hover:underline">buka</a>
-            <span class="text-gray-400 ml-1">(${p.id})</span>
+        if (!checks.length) {
+          alert("Pilih minimal 1 Page.");
+          return;
+        }
+
+        const limitInput = document.getElementById("post-limit");
+        const limit = Number.parseInt(limitInput.value, 10);
+        const since = document.getElementById("since").value;
+        const postsEl = document.getElementById("posts");
+        const statusEl = document.getElementById("load-status");
+        const loadButton = Array.from(document.querySelectorAll("button")).find(
+          (button) => button.textContent.trim() === "Load Posts",
+        );
+
+        if (!Number.isInteger(limit) || limit < 1 || limit > 10000) {
+          statusEl.textContent =
+            "Jumlah postingan harus antara 1 dan 10.000 per Page.";
+          statusEl.className = "mb-3 text-sm whitespace-pre-line text-red-600";
+          return;
+        }
+
+        document.getElementById("posts-area").classList.remove("hidden");
+        postsEl.textContent = "Sedang memuat postingan...";
+        statusEl.textContent = "";
+        statusEl.className = "mb-3 text-sm whitespace-pre-line";
+        selectedPosts.clear();
+
+        if (loadButton) loadButton.disabled = true;
+
+        const allPosts = [];
+        const seenIds = new Set();
+        const reports = [];
+
+        try {
+          for (let index = 0; index < checks.length; index++) {
+            const cb = checks[index];
+            const pageId = cb.value;
+            const pageName = cb.dataset.name || pageId;
+
+            statusEl.textContent = `Memuat Page ${index + 1}/${checks.length}: ${pageName}...`;
+
+            const query = new URLSearchParams({ limit: String(limit) });
+            if (since) query.set("since", since);
+
+            try {
+              const url =
+                `/api/posts/${encodeURIComponent(sessionId)}/` +
+                `${encodeURIComponent(pageId)}?${query.toString()}`;
+
+              const res = await fetch(url);
+              let data;
+
+              try {
+                data = await res.json();
+              } catch {
+                throw new Error(
+                  `Server mengirim respons yang bukan JSON (HTTP ${res.status}).`,
+                );
+              }
+
+              if (!res.ok) {
+                throw new Error(data.detail || `HTTP ${res.status}`);
+              }
+
+              if (!Array.isArray(data.posts)) {
+                throw new Error("Format hasil dari server tidak valid.");
+              }
+
+              let added = 0;
+
+              for (const post of data.posts) {
+                if (!post || !post.id || seenIds.has(post.id)) continue;
+
+                seenIds.add(post.id);
+                post._pageName = pageName;
+                post._pageId = pageId;
+                allPosts.push(post);
+                added++;
+              }
+
+              let message = `${pageName}: ${data.count ?? data.posts.length} postingan diterima`;
+
+              if (data.limit_reached) {
+                message += ` (target ${limit} tercapai)`;
+              } else if (data.exhausted) {
+                message += " (tidak ada halaman berikutnya dari Meta)";
+              }
+
+              if (data.warning) {
+                message += `\nPERINGATAN: ${data.warning}`;
+              } else if (!data.limit_reached && !data.exhausted) {
+                message +=
+                  "\nStatus belum dapat dipastikan: target belum tercapai.";
+              }
+
+              reports.push(message);
+            } catch (error) {
+              reports.push(
+                `${pageName}: GAGAL MEMUAT POSTINGAN.\nPenyebab: ${error.message}`,
+              );
+            }
+          }
+
+          // Tampilkan hasil dan laporan secara terpisah supaya laporan
+          // tidak tertimpa ketika daftar postingan dirender.
+          statusEl.textContent = reports.join("\n\n");
+          statusEl.className =
+            "mb-3 text-sm whitespace-pre-line " +
+            (reports.some(
+              (text) =>
+                text.includes("GAGAL MEMUAT") || text.includes("PERINGATAN"),
+            )
+              ? "text-red-600"
+              : "text-gray-700");
+
+          console.log("Unique posts loaded:", allPosts.length);
+
+          if (!allPosts.length) {
+            postsEl.textContent = reports.some(
+              (text) =>
+                text.includes("GAGAL MEMUAT") || text.includes("PERINGATAN"),
+            )
+              ? "Tidak ada postingan yang berhasil dimuat. Baca laporan di atas; ini tidak berarti Page pasti kosong."
+              : "Tidak ditemukan postingan pada rentang dan batas yang dipilih.";
+            return;
+          }
+
+          postsEl.innerHTML = allPosts
+            .map((p) => {
+              let thumb = "";
+              let mediaLabel = "";
+
+              if (p.full_picture) {
+                thumb = p.full_picture;
+              } else if (p.attachments?.data?.[0]) {
+                const att = p.attachments.data[0];
+                if (att.media?.image?.src) thumb = att.media.image.src;
+                if (att.type) mediaLabel = att.type;
+              }
+
+              const text = (p.message || "").trim() || "(tidak ada caption)";
+              const shortText =
+                text.length > 140 ? text.slice(0, 140) + "…" : text;
+              const protectedFlag = isProtected(p.id);
+
+              return `
+        <label class="flex gap-3 py-2 border-b hover:bg-gray-50 text-xs items-start ${protectedFlag ? "bg-yellow-50 border-l-4 border-orange-400" : ""}">
+          <input type="checkbox" class="post-check mt-1"
+            value="${p.id}" data-page="${p._pageId}"
+            ${protectedFlag ? "disabled" : ""}>
+          ${
+            thumb
+              ? `<img src="${thumb}" class="w-16 h-16 object-cover rounded flex-shrink-0 bg-gray-200" loading="lazy" onerror="this.style.display='none'">`
+              : '<div class="w-16 h-16 bg-gray-200 rounded flex-shrink-0 flex items-center justify-center text-gray-400 text-[10px]">no img</div>'
+          }
+          <div class="flex-1 min-w-0">
+            <div class="font-medium break-words">${shortText}${protectedFlag ? ' <span class="ads-badge ml-1 px-1.5 py-0.5 bg-orange-500 text-white text-[10px] rounded">ADS</span>' : ""}</div>
+            <div class="text-gray-500 mt-1">
+              ${p.created_time?.slice(0, 16).replace("T", " ") || ""}
+              · ${p._pageName}
+              ${mediaLabel ? ` · <span class="text-blue-600">${mediaLabel}</span>` : ""}
+              · <a href="${p.permalink_url || "#"}" target="_blank" rel="noopener noreferrer" class="text-blue-600 hover:underline">buka</a>
+              <span class="text-gray-400 ml-1">(${p.id})</span>
+            </div>
           </div>
-        </div>
-      </label>
-    `;
-  }).join('') || '<div class="text-gray-500">Tidak ada postingan</div>';
-}
+        </label>
+      `;
+            })
+            .join("");
 
-function selectAll() {
-  document.querySelectorAll('.post-check:not(:disabled)').forEach(cb => {
-    cb.checked = true;
-    selectedPosts.add(cb.value);
-  });
-}
-function deselectAll() {
-  document.querySelectorAll('.post-check').forEach(cb => cb.checked = false);
-  selectedPosts.clear();
-}
-
-document.addEventListener('change', e => {
-  if (e.target.classList.contains('post-check')) {
-    if (e.target.checked) selectedPosts.add(e.target.value);
-    else selectedPosts.delete(e.target.value);
-  }
-});
-
-async function deleteSelected() {
-  const checked = Array.from(document.querySelectorAll('.post-check:checked')).filter(cb => !cb.disabled);
-  const ids = checked.map(cb => cb.value);
-  if (!ids.length) return alert('Pilih postingan dulu (postingan ADS tidak bisa dipilih)');
-  const dry = document.getElementById('dry-run').checked;
-  const delayInput = parseInt(document.getElementById('delay').value);
-  const delay = Number.isFinite(delayInput) ? Math.max(0, Math.min(delayInput, 60000)) : 300;
-  const concurrencyInput = parseInt(document.getElementById('concurrency').value);
-  const concurrency = Number.isFinite(concurrencyInput) ? Math.max(1, Math.min(concurrencyInput, 5)) : 3;
-  if (!dry && !confirm(`Hapus ${ids.length} postingan secara permanen?\n\nPostingan yang bertanda ADS akan di-skip.`)) return;
-
-  const logArea = document.getElementById('log-area');
-  const log = document.getElementById('log');
-  const progressText = document.getElementById('progress-text');
-  const progressBar = document.getElementById('progress-bar');
-  logArea.classList.remove('hidden');
-  log.textContent = `Memulai proses ${ids.length} postingan... (dry_run=${dry}, paralel=${concurrency})\n`;
-  progressText.textContent = `Selesai 0 dari ${ids.length} | Berhasil 0 | Gagal 0`;
-  progressBar.style.width = '0%';
-
-  try {
-    const res = await fetch('/api/delete', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        session_id: sessionId, post_ids: ids, page_tokens: {},
-        dry_run: dry, delay_ms: delay, concurrency: concurrency
-      })
-    });
-    const started = await res.json();
-    if (!res.ok) throw new Error(started.detail || res.statusText);
-
-    let data;
-    while (true) {
-      await new Promise(resolve => setTimeout(resolve, 500));
-      const poll = await fetch(`/api/delete/progress/${started.job_id}`);
-      data = await poll.json();
-      if (!poll.ok) throw new Error(data.detail || 'Gagal membaca progres');
-
-      const completed = data.completed || 0;
-      const total = data.total || ids.length;
-      const pct = total ? Math.round(completed / total * 100) : 100;
-      progressText.textContent = `Selesai ${completed} dari ${total} (${pct}%) | Berhasil ${data.success || 0} | Gagal ${data.failed || 0}`;
-      progressBar.style.width = `${pct}%`;
-      if (data.status !== 'running') break;
-    }
-
-    if (data.status === 'error') throw new Error(data.error || 'Proses berhenti karena error');
-    log.textContent += `\nSelesai: ${data.success}/${data.total} berhasil (paralel=${data.concurrency || concurrency})\n`;
-    (data.results || []).forEach(r => {
-      log.textContent += `${r.success ? '✓' : '✗'} ${r.post_id} ${r.dry_run ? '(dry)' : ''} ${r.error || r.message || ''}\n`;
-      if (r.success && !r.dry_run) {
-        const cb = Array.from(document.querySelectorAll('.post-check')).find(el => el.value === r.post_id);
-        if (cb) cb.closest('label').remove();
+          // Terapkan kembali penandaan iklan yang sudah diperiksa sebelumnya.
+          markProtectedPosts();
+        } catch (error) {
+          statusEl.textContent = `Terjadi kesalahan saat memuat postingan: ${error.message}`;
+          statusEl.className = "mb-3 text-sm whitespace-pre-line text-red-600";
+          postsEl.textContent =
+            "Pemuatan tidak selesai. Periksa pesan error sebelum mencoba lagi.";
+        } finally {
+          if (loadButton) loadButton.disabled = false;
+        }
       }
-    });
-  } catch (e) {
-    log.textContent += `\nGagal: ${e.message}\n`;
-    progressText.textContent = 'Proses gagal atau koneksi terputus. Periksa log dan status postingan sebelum mengulangi.';
-  }
-}
 
-async function logout() {
-  if (sessionId) {
-    const fd = new FormData();
-    fd.append('session_id', sessionId);
-    await fetch('/api/logout', { method: 'POST', body: fd });
-  }
-  location.reload();
-}
-</script>
-</body>
+      function selectAll() {
+        document
+          .querySelectorAll(".post-check:not(:disabled)")
+          .forEach((cb) => {
+            cb.checked = true;
+            selectedPosts.add(cb.value);
+          });
+      }
+      function deselectAll() {
+        document
+          .querySelectorAll(".post-check")
+          .forEach((cb) => (cb.checked = false));
+        selectedPosts.clear();
+      }
+
+      document.addEventListener("change", (e) => {
+        if (e.target.classList.contains("post-check")) {
+          if (e.target.checked) selectedPosts.add(e.target.value);
+          else selectedPosts.delete(e.target.value);
+        }
+      });
+
+      async function deleteSelected() {
+        const checked = Array.from(
+          document.querySelectorAll(".post-check:checked"),
+        ).filter((cb) => !cb.disabled);
+        const ids = checked.map((cb) => cb.value);
+        if (!ids.length)
+          return alert(
+            "Pilih postingan dulu (postingan ADS tidak bisa dipilih)",
+          );
+        const dry = document.getElementById("dry-run").checked;
+        const delayInput = parseInt(document.getElementById("delay").value);
+        const delay = Number.isFinite(delayInput)
+          ? Math.max(0, Math.min(delayInput, 60000))
+          : 300;
+        const concurrencyInput = parseInt(
+          document.getElementById("concurrency").value,
+        );
+        const concurrency = Number.isFinite(concurrencyInput)
+          ? Math.max(1, Math.min(concurrencyInput, 5))
+          : 3;
+        if (
+          !dry &&
+          !confirm(
+            `Hapus ${ids.length} postingan secara permanen?\n\nPostingan yang bertanda ADS akan di-skip.`,
+          )
+        )
+          return;
+
+        const logArea = document.getElementById("log-area");
+        const log = document.getElementById("log");
+        const progressText = document.getElementById("progress-text");
+        const progressBar = document.getElementById("progress-bar");
+        logArea.classList.remove("hidden");
+        log.textContent = `Memulai proses ${ids.length} postingan... (dry_run=${dry}, paralel=${concurrency})\n`;
+        progressText.textContent = `Selesai 0 dari ${ids.length} | Berhasil 0 | Gagal 0`;
+        progressBar.style.width = "0%";
+
+        try {
+          const res = await fetch("/api/delete", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              session_id: sessionId,
+              post_ids: ids,
+              page_tokens: {},
+              dry_run: dry,
+              delay_ms: delay,
+              concurrency: concurrency,
+            }),
+          });
+          const started = await res.json();
+          if (!res.ok) throw new Error(started.detail || res.statusText);
+
+          let data;
+          while (true) {
+            await new Promise((resolve) => setTimeout(resolve, 500));
+            const poll = await fetch(`/api/delete/progress/${started.job_id}`);
+            data = await poll.json();
+            if (!poll.ok)
+              throw new Error(data.detail || "Gagal membaca progres");
+
+            const completed = data.completed || 0;
+            const total = data.total || ids.length;
+            const pct = total ? Math.round((completed / total) * 100) : 100;
+            progressText.textContent = `Selesai ${completed} dari ${total} (${pct}%) | Berhasil ${data.success || 0} | Gagal ${data.failed || 0}`;
+            progressBar.style.width = `${pct}%`;
+            if (data.status !== "running") break;
+          }
+
+          if (data.status === "error")
+            throw new Error(data.error || "Proses berhenti karena error");
+          log.textContent += `\nSelesai: ${data.success}/${data.total} berhasil (paralel=${data.concurrency || concurrency})\n`;
+          (data.results || []).forEach((r) => {
+            log.textContent += `${r.success ? "✓" : "✗"} ${r.post_id} ${r.dry_run ? "(dry)" : ""} ${r.error || r.message || ""}\n`;
+            if (r.success && !r.dry_run) {
+              const cb = Array.from(
+                document.querySelectorAll(".post-check"),
+              ).find((el) => el.value === r.post_id);
+              if (cb) cb.closest("label").remove();
+            }
+          });
+        } catch (e) {
+          log.textContent += `\nGagal: ${e.message}\n`;
+          progressText.textContent =
+            "Proses gagal atau koneksi terputus. Periksa log dan status postingan sebelum mengulangi.";
+        }
+      }
+
+      async function logout() {
+        if (sessionId) {
+          const fd = new FormData();
+          fd.append("session_id", sessionId);
+          await fetch("/api/logout", { method: "POST", body: fd });
+        }
+        location.reload();
+      }
+    </script>
+  </body>
 </html>
