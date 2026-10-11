@@ -151,121 +151,85 @@ async def get_posts(
     since: Optional[str] = None,
     until: Optional[str] = None,
 ):
-    """Memuat postingan. Coba /posts dulu, lalu /feed jika hasil terlalu sedikit."""
-
     if limit < 1 or limit > 10000:
-        raise HTTPException(
-            status_code=400,
-            detail="Jumlah postingan harus antara 1 dan 10.000 per Page.",
-        )
+        raise HTTPException(status_code=400, detail="Jumlah postingan harus antara 1 dan 10.000 per Page.")
 
     sess = SESSIONS.get(session_id)
     if not sess:
-        raise HTTPException(status_code=404, detail="Sesi sudah berakhir. Silakan login kembali.")
+        raise HTTPException(status_code=404, detail="Sesi sudah berakhir.")
 
     page = next((p for p in sess["pages"] if str(p.get("id")) == str(page_id)), None)
-    if not page:
-        raise HTTPException(status_code=404, detail="Page tidak ditemukan dalam sesi ini.")
-
-    page_token = page.get("access_token")
-    if not page_token:
+    if not page or not page.get("access_token"):
         raise HTTPException(status_code=400, detail="Token Page tidak ditemukan.")
 
+    page_token = page["access_token"]
+
     fields = (
-        "id,message,created_time,permalink_url,status_type,"
-        "full_picture,attachments{media,type,title,description,url}"
+        "id,message,created_time,permalink_url,status_type,full_picture,"
+        "attachments{media_type,media,type,title,description,url,subattachments}"
     )
 
-    async def fetch_from_endpoint(endpoint: str):
-        posts = []
-        seen = set()
-        visited = set()
+    async def fetch(endpoint: str):
+        posts, seen, visited = [], set(), set()
         warning = None
-        exhausted = False
         url = f"{BASE_URL}/{page_id}/{endpoint}"
-        params = {
-            "fields": fields,
-            "limit": 100,
-            "access_token": page_token,
-        }
-        if since:
-            params["since"] = since
-        if until:
-            params["until"] = until
+        params = {"fields": fields, "limit": 100, "access_token": page_token}
+        if since: params["since"] = since
+        if until: params["until"] = until
         first = True
 
         async with httpx.AsyncClient(timeout=45.0) as client:
             while url and len(posts) < limit:
                 if url in visited:
-                    warning = "Pagination berulang, dihentikan."
                     break
                 visited.add(url)
-
                 try:
                     r = await client.get(url, params=params if first else None)
                 except Exception as e:
-                    warning = f"Error koneksi: {type(e).__name__}"
+                    warning = str(e)
                     break
                 first = False
-
                 try:
                     data = r.json()
                 except Exception:
-                    warning = "Respons bukan JSON"
+                    warning = "Bukan JSON"
                     break
-
                 if not isinstance(data, dict) or "error" in data:
-                    err = data.get("error", {}) if isinstance(data, dict) else {}
-                    warning = err.get("message", "Meta API error")
+                    warning = (data.get("error") or {}).get("message", "API error")
                     break
-
-                batch = data.get("data", [])
-                if not isinstance(batch, list):
-                    break
-
-                for p in batch:
+                for p in data.get("data", []):
                     if isinstance(p, dict) and p.get("id") and p["id"] not in seen:
                         seen.add(p["id"])
                         posts.append(p)
                         if len(posts) >= limit:
                             break
-
-                next_url = (data.get("paging") or {}).get("next")
-                if not next_url:
-                    exhausted = True
-                    break
-                url = next_url
+                url = (data.get("paging") or {}).get("next")
                 params = None
+        return posts, warning
 
-        return posts, warning, exhausted
+    all_posts = []
+    seen_ids = set()
+    warnings = []
 
-    # 1. Coba /posts dulu
-    posts, warning, exhausted = await fetch_from_endpoint("posts")
+    for endpoint in ("posts", "feed", "published_posts"):
+        batch, warn = await fetch(endpoint)
+        if warn:
+            warnings.append(f"{endpoint}: {warn}")
+        for p in batch:
+            if p["id"] not in seen_ids and len(all_posts) < limit:
+                seen_ids.add(p["id"])
+                all_posts.append(p)
+        if len(all_posts) >= limit:
+            break
 
-    # 2. Kalau hasil sangat sedikit, coba /feed sebagai tambahan
-    if len(posts) < min(50, limit) and not warning:
-        feed_posts, feed_warning, _ = await fetch_from_endpoint("feed")
-        if feed_posts:
-            existing = {p["id"] for p in posts}
-            for p in feed_posts:
-                if p["id"] not in existing and len(posts) < limit:
-                    posts.append(p)
-                    existing.add(p["id"])
-            if feed_warning and not warning:
-                warning = feed_warning
-
-    count = len(posts)
     return {
         "page_id": page_id,
-        "posts": posts,
-        "count": count,
+        "posts": all_posts,
+        "count": len(all_posts),
         "requested_limit": limit,
-        "limit_reached": count >= limit,
-        "exhausted": exhausted,
-        "complete": count >= limit or (exhausted and not warning),
-        "warning": warning,
+        "limit_reached": len(all_posts) >= limit,
+        "warning": "; ".join(warnings) if warnings else None,
     }
-
 DELETE_JOBS: Dict[str, Dict[str, Any]] = {}
 
 
