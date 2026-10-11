@@ -144,7 +144,6 @@ async def login(token: str = Form(...)):
 
 
 @app.get("/api/posts/{session_id}/{page_id}")
-
 async def get_posts(
     session_id: str,
     page_id: str,
@@ -152,7 +151,7 @@ async def get_posts(
     since: Optional[str] = None,
     until: Optional[str] = None,
 ):
-    """Memuat postingan dengan pagination dan laporan diagnostik."""
+    """Memuat postingan. Coba /posts dulu, lalu /feed jika hasil terlalu sedikit."""
 
     if limit < 1 or limit > 10000:
         raise HTTPException(
@@ -162,194 +161,110 @@ async def get_posts(
 
     sess = SESSIONS.get(session_id)
     if not sess:
-        raise HTTPException(
-            status_code=404,
-            detail="Sesi sudah berakhir. Silakan login kembali.",
-        )
+        raise HTTPException(status_code=404, detail="Sesi sudah berakhir. Silakan login kembali.")
 
-    page = next(
-        (
-            p for p in sess["pages"]
-            if str(p.get("id")) == str(page_id)
-        ),
-        None,
-    )
-
+    page = next((p for p in sess["pages"] if str(p.get("id")) == str(page_id)), None)
     if not page:
-        raise HTTPException(
-            status_code=404,
-            detail="Page tidak ditemukan dalam sesi ini.",
-        )
+        raise HTTPException(status_code=404, detail="Page tidak ditemukan dalam sesi ini.")
 
     page_token = page.get("access_token")
     if not page_token:
-        raise HTTPException(
-            status_code=400,
-            detail="Token Page tidak ditemukan. Periksa izin akses token.",
-        )
+        raise HTTPException(status_code=400, detail="Token Page tidak ditemukan.")
 
-    params = {
-        "fields": (
-            "id,message,created_time,permalink_url,status_type,"
-            "full_picture,attachments{media,type,title,description,url}"
-        ),
-        "limit": 100,
-        "access_token": page_token,
-    }
+    fields = (
+        "id,message,created_time,permalink_url,status_type,"
+        "full_picture,attachments{media,type,title,description,url}"
+    )
 
-    if since:
-        params["since"] = since
-    if until:
-        params["until"] = until
+    async def fetch_from_endpoint(endpoint: str):
+        posts = []
+        seen = set()
+        visited = set()
+        warning = None
+        exhausted = False
+        url = f"{BASE_URL}/{page_id}/{endpoint}"
+        params = {
+            "fields": fields,
+            "limit": 100,
+            "access_token": page_token,
+        }
+        if since:
+            params["since"] = since
+        if until:
+            params["until"] = until
+        first = True
 
-    posts = []
-    seen_ids = set()
-    visited_urls = set()
-    warning = None
-    exhausted = False
-
-    url = f"{BASE_URL}/{page_id}/posts"
-    first_request = True
-
-    try:
         async with httpx.AsyncClient(timeout=45.0) as client:
             while url and len(posts) < limit:
-                if url in visited_urls:
-                    warning = (
-                        "Pagination Meta mengulang URL yang sama. "
-                        "Proses dihentikan untuk mencegah perulangan."
-                    )
+                if url in visited:
+                    warning = "Pagination berulang, dihentikan."
                     break
-
-                visited_urls.add(url)
+                visited.add(url)
 
                 try:
-                    response = await client.get(
-                        url,
-                        params=params if first_request else None,
-                    )
-                except httpx.TimeoutException:
-                    warning = (
-                        "Permintaan ke Meta mengalami timeout. "
-                        "Hasil mungkin hanya sebagian."
-                    )
+                    r = await client.get(url, params=params if first else None)
+                except Exception as e:
+                    warning = f"Error koneksi: {type(e).__name__}"
                     break
-                except httpx.HTTPError as exc:
-                    warning = (
-                        f"Koneksi ke Meta gagal: {type(exc).__name__}. "
-                        "Hasil mungkin hanya sebagian."
-                    )
-                    break
-
-                first_request = False
+                first = False
 
                 try:
-                    data = response.json()
-                except ValueError:
-                    warning = (
-                        f"Meta mengirim respons bukan JSON "
-                        f"(HTTP {response.status_code})."
-                    )
+                    data = r.json()
+                except Exception:
+                    warning = "Respons bukan JSON"
                     break
 
-                if not isinstance(data, dict):
-                    warning = "Format respons Meta tidak sesuai."
-                    break
-
-                if "error" in data:
-                    meta_error = data.get("error") or {}
-                    message = meta_error.get(
-                        "message",
-                        "Meta API mengembalikan error.",
-                    )
-                    code = meta_error.get("code")
-                    warning = (
-                        f"Meta API error"
-                        f"{f' (kode {code})' if code else ''}: {message}"
-                    )
-                    break
-
-                if response.is_error:
-                    warning = (
-                        f"Meta mengembalikan HTTP {response.status_code}. "
-                        "Hasil mungkin hanya sebagian."
-                    )
+                if not isinstance(data, dict) or "error" in data:
+                    err = data.get("error", {}) if isinstance(data, dict) else {}
+                    warning = err.get("message", "Meta API error")
                     break
 
                 batch = data.get("data", [])
-                paging_info = data.get("paging") or {}
-
                 if not isinstance(batch, list):
-                    warning = "Format daftar postingan dari Meta tidak valid."
                     break
 
-                if not isinstance(paging_info, dict):
-                    warning = "Format informasi pagination Meta tidak valid."
-                    break
-
-                cursors = paging_info.get("cursors") or {}
-                next_url = paging_info.get("next")
-
-                print(
-                    "[POSTS DIAGNOSTIC]",
-                    {
-                        "page_id": page_id,
-                        "http_status": response.status_code,
-                        "requested_limit": limit,
-                        "items_received": len(batch),
-                        "total_collected_before_batch": len(posts),
-                        "has_next": bool(next_url),
-                        "has_after_cursor": bool(
-                            cursors.get("after")
-                        ),
-                        "paging_keys": list(paging_info.keys()),
-                        "meta_error": data.get("error"),
-                    },
-                    flush=True,
-                )
-
-                for post in batch:
-                    if not isinstance(post, dict):
-                        continue
-
-                    post_id = post.get("id")
-                    if post_id and post_id not in seen_ids:
-                        seen_ids.add(post_id)
-                        posts.append(post)
-
+                for p in batch:
+                    if isinstance(p, dict) and p.get("id") and p["id"] not in seen:
+                        seen.add(p["id"])
+                        posts.append(p)
                         if len(posts) >= limit:
                             break
 
-                if len(posts) >= limit:
-                    break
-
+                next_url = (data.get("paging") or {}).get("next")
                 if not next_url:
                     exhausted = True
                     break
-
                 url = next_url
                 params = None
 
-    except Exception as exc:
-        warning = (
-            "Kesalahan internal saat memuat postingan: "
-            f"{type(exc).__name__}: {exc}"
-        )
+        return posts, warning, exhausted
+
+    # 1. Coba /posts dulu
+    posts, warning, exhausted = await fetch_from_endpoint("posts")
+
+    # 2. Kalau hasil sangat sedikit, coba /feed sebagai tambahan
+    if len(posts) < min(50, limit) and not warning:
+        feed_posts, feed_warning, _ = await fetch_from_endpoint("feed")
+        if feed_posts:
+            existing = {p["id"] for p in posts}
+            for p in feed_posts:
+                if p["id"] not in existing and len(posts) < limit:
+                    posts.append(p)
+                    existing.add(p["id"])
+            if feed_warning and not warning:
+                warning = feed_warning
 
     count = len(posts)
-    limit_reached = count >= limit
-
     return {
         "page_id": page_id,
         "posts": posts,
         "count": count,
         "requested_limit": limit,
-        "limit_reached": limit_reached,
+        "limit_reached": count >= limit,
         "exhausted": exhausted,
-        "complete": limit_reached or (exhausted and warning is None),
+        "complete": count >= limit or (exhausted and not warning),
         "warning": warning,
     }
-
 
 DELETE_JOBS: Dict[str, Dict[str, Any]] = {}
 
