@@ -221,6 +221,22 @@ async def get_posts(
                     break
 
                 batch = data.get("data", [])
+                paging_info = data.get("paging") or {}
+
+print(
+    "[POSTS DIAGNOSTIC]",
+    {
+        "page_id": page_id,
+        "http_status": response.status_code,
+        "items_received": len(batch),
+        "has_next": bool(paging_info.get("next")),
+        "has_after_cursor": bool(
+            (paging_info.get("cursors") or {}).get("after")
+        ),
+        "paging_keys": list(paging_info.keys()),
+        "meta_error": data.get("error"),
+    },
+)
                 if not isinstance(batch, list):
                     warning = "Format daftar postingan dari Meta tidak valid."
                     break
