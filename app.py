@@ -144,6 +144,7 @@ async def login(token: str = Form(...)):
 
 
 @app.get("/api/posts/{session_id}/{page_id}")
+
 async def get_posts(
     session_id: str,
     page_id: str,
@@ -167,7 +168,10 @@ async def get_posts(
         )
 
     page = next(
-        (p for p in sess["pages"] if str(p.get("id")) == str(page_id)),
+        (
+            p for p in sess["pages"]
+            if str(p.get("id")) == str(page_id)
+        ),
         None,
     )
 
@@ -210,8 +214,6 @@ async def get_posts(
     try:
         async with httpx.AsyncClient(timeout=45.0) as client:
             while url and len(posts) < limit:
-
-                # Mencegah pagination berulang tanpa akhir.
                 if url in visited_urls:
                     warning = (
                         "Pagination Meta mengulang URL yang sama. "
@@ -245,7 +247,7 @@ async def get_posts(
                     data = response.json()
                 except ValueError:
                     warning = (
-                        "Meta mengirim respons yang bukan JSON "
+                        f"Meta mengirim respons bukan JSON "
                         f"(HTTP {response.status_code})."
                     )
                     break
@@ -261,7 +263,6 @@ async def get_posts(
                         "Meta API mengembalikan error.",
                     )
                     code = meta_error.get("code")
-
                     warning = (
                         f"Meta API error"
                         f"{f' (kode {code})' if code else ''}: {message}"
@@ -275,26 +276,31 @@ async def get_posts(
                     )
                     break
 
-                # Ambil batch postingan dan informasi pagination.
                 batch = data.get("data", [])
                 paging_info = data.get("paging") or {}
+
+                if not isinstance(batch, list):
+                    warning = "Format daftar postingan dari Meta tidak valid."
+                    break
 
                 if not isinstance(paging_info, dict):
                     warning = "Format informasi pagination Meta tidak valid."
                     break
 
-                # Diagnostik untuk diperiksa melalui log Railway.
+                cursors = paging_info.get("cursors") or {}
+                next_url = paging_info.get("next")
+
                 print(
                     "[POSTS DIAGNOSTIC]",
                     {
                         "page_id": page_id,
                         "http_status": response.status_code,
-                        "items_received": (
-                            len(batch) if isinstance(batch, list) else None
-                        ),
-                        "has_next": bool(paging_info.get("next")),
+                        "requested_limit": limit,
+                        "items_received": len(batch),
+                        "total_collected_before_batch": len(posts),
+                        "has_next": bool(next_url),
                         "has_after_cursor": bool(
-                            (paging_info.get("cursors") or {}).get("after")
+                            cursors.get("after")
                         ),
                         "paging_keys": list(paging_info.keys()),
                         "meta_error": data.get("error"),
@@ -302,26 +308,17 @@ async def get_posts(
                     flush=True,
                 )
 
-                if not isinstance(batch, list):
-                    warning = "Format daftar postingan dari Meta tidak valid."
-                    break
-
-                # PENTING: setiap batch hanya diproses satu kali.
                 for post in batch:
                     if not isinstance(post, dict):
                         continue
 
                     post_id = post.get("id")
-
                     if post_id and post_id not in seen_ids:
                         seen_ids.add(post_id)
                         posts.append(post)
 
                         if len(posts) >= limit:
                             break
-
-                # Tentukan halaman berikutnya dari respons Meta.
-                next_url = paging_info.get("next")
 
                 if len(posts) >= limit:
                     break
