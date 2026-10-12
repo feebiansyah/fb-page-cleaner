@@ -46,6 +46,10 @@ REEL_FIELDS_TRY = (
 RATE_LIMIT_CODES = {4, 17, 32, 341, 613, 80001, 80004}
 LIMIT_CODES = {4, 17, 32, 341, 613, 80001, 80004}
 TRANSIENT_CODES = {1, 2}
+# Untuk DELETE, kode 1 ("unknown error") biasanya permanen, jangan diulang-ulang
+# karena tiap ulangan memakai kuota. Hanya kode 2 / is_transient yang diulang.
+DELETE_TRANSIENT_CODES = {2}
+DELETE_TRANSIENT_RETRIES = 2
 WINDOW_SECONDS = 90 * 86400
 SPLIT_THRESHOLD = 400
 MAX_EMPTY_WINDOWS = 6
@@ -57,7 +61,7 @@ ACCOUNTS_CACHE_TTL = max(0, int(os.environ.get("ACCOUNTS_CACHE_TTL", "60")))
 # supaya beberapa device dengan token yang sama tidak saling antre.
 FB_MAX_INFLIGHT = max(1, min(20, int(os.environ.get("FB_MAX_INFLIGHT", "10"))))
 # Jeda otomatis saat x-app-usage >= nilai ini (persen). 0 = nonaktif.
-USAGE_PAUSE_PCT = int(os.environ.get("USAGE_PAUSE_PCT", "90"))
+USAGE_PAUSE_PCT = int(os.environ.get("USAGE_PAUSE_PCT", "95"))
 # Berapa kali kena limit (berurutan) sebelum job berhenti dan bisa dilanjutkan.
 MAX_LIMIT_HITS = max(1, int(os.environ.get("MAX_LIMIT_HITS", "8")))
 
@@ -145,12 +149,14 @@ def _cooldown_remaining() -> float:
     return max(0.0, FB_COOLDOWN_UNTIL - time.time())
 
 
-async def _wait_for_cooldown() -> None:
+async def _wait_for_cooldown(should_quit=None) -> None:
     while True:
+        if should_quit and should_quit():
+            return
         wait = _cooldown_remaining()
         if wait <= 0:
             return
-        await asyncio.sleep(min(wait, 5.0))
+        await asyncio.sleep(min(wait, 1.0))
 
 
 async def _set_cooldown(seconds: float, code: Optional[int]) -> None:
@@ -162,7 +168,7 @@ async def _set_cooldown(seconds: float, code: Optional[int]) -> None:
         FB_USAGE["last_rate_limit_code"] = code
 
 
-async def _throttle_by_usage() -> None:
+async def _throttle_by_usage(should_quit=None) -> None:
     """Jika pemakaian app hampir penuh, tahan sebentar sebelum request berikutnya.
 
     Nilai usage hanya diperbarui saat ada response, jadi kita tunggu sampai
@@ -171,9 +177,11 @@ async def _throttle_by_usage() -> None:
     if USAGE_PAUSE_PCT <= 0:
         return
     if FB_USAGE_PCT >= USAGE_PAUSE_PCT:
-        wait = 60.0 - (time.time() - FB_USAGE_AT)
-        if wait > 0:
-            await asyncio.sleep(min(wait, 60.0))
+        end = FB_USAGE_AT + 60.0
+        while time.time() < end:
+            if should_quit and should_quit():
+                return
+            await asyncio.sleep(1.0)
 
 
 async def fb_get(
@@ -596,6 +604,31 @@ async def load_progress(job_id: str):
 
 
 # ------------------------------------------------------------------ delete
+def _job_log(job: dict, msg: str) -> None:
+    job["log"].append(f"{datetime.now().strftime('%H:%M:%S')} {msg}")
+    if len(job["log"]) > 80:
+        del job["log"][:-80]
+
+
+def _status_message(job: dict) -> str:
+    """Teks status yang jujur: kenapa proses sedang diam."""
+    if job["status"] != "running":
+        return {
+            "completed": "Selesai",
+            "stopped": "Dihentikan karena limit Facebook",
+            "cancelled": "Dibatalkan",
+            "error": "Error",
+        }.get(job["status"], job["status"])
+    rem = int(_cooldown_remaining())
+    if rem > 0:
+        return (f"Kena limit Facebook (kode {FB_USAGE.get('last_rate_limit_code')}). "
+                f"Lanjut otomatis dalam {rem} dtk")
+    if (USAGE_PAUSE_PCT > 0 and FB_USAGE_PCT >= USAGE_PAUSE_PCT
+            and time.time() - FB_USAGE_AT < 60):
+        return f"Pemakaian API {FB_USAGE_PCT:.0f}% - jeda otomatis agar tidak diblokir"
+    return f"Menghapus... {job['completed']}/{job['total']}"
+
+
 async def run_delete_job(job_id: str, req: DeleteRequest):
     job = DELETE_JOBS[job_id]
     sess = SESSIONS.get(req.session_id)
@@ -640,8 +673,8 @@ async def run_delete_job(job_id: str, req: DeleteRequest):
         while True:
             if should_quit():
                 return
-            await _wait_for_cooldown()
-            await _throttle_by_usage()
+            await _wait_for_cooldown(should_quit)
+            await _throttle_by_usage(should_quit)
             if should_quit():
                 return
 
@@ -683,6 +716,9 @@ async def run_delete_job(job_id: str, req: DeleteRequest):
                 return
 
             # ---- kena limit: cooldown bersama, lalu ulangi post yang sama
+            if err:
+                job["last_error"] = {"post_id": post_id, "code": code,
+                                     "subcode": err.get("error_subcode"), "message": msg[:300]}
             if code in LIMIT_CODES:
                 state["ok_streak"] = 0
                 # Hanya hitung sekali per kejadian (worker lain yang response-nya
@@ -700,6 +736,7 @@ async def run_delete_job(job_id: str, req: DeleteRequest):
                         return
                     retry_after = _retry_after_seconds(resp)
                     wait = retry_after if retry_after else 60.0 * (2 ** (state["limit_hits"] - 1))
+                    _job_log(job, f"LIMIT kode {code} (ke-{state['limit_hits']}): {msg[:120]} -> tunggu {int(min(wait, 300))} dtk")
                     await _set_cooldown(wait, code)
                 continue
 
@@ -710,15 +747,16 @@ async def run_delete_job(job_id: str, req: DeleteRequest):
                 return
 
             # ---- error sementara: ulangi dengan backoff pendek
-            if code in TRANSIENT_CODES or err.get("is_transient") or resp.status_code >= 500:
+            if code in DELETE_TRANSIENT_CODES or err.get("is_transient") or resp.status_code >= 500:
                 transient += 1
-                if transient > 4:
+                if transient > DELETE_TRANSIENT_RETRIES:
                     record({"post_id": post_id, "success": False, "error": msg or f"HTTP {resp.status_code}"})
                     return
                 await asyncio.sleep(min(15.0, 2.0 * (2 ** transient)))
                 continue
 
             # ---- gagal biasa (izin, objek tidak ada, dll)
+            _job_log(job, f"GAGAL {post_id}: kode {code} {msg[:120]}")
             state["ok_streak"] += 1
             record({"post_id": post_id, "success": False, "error": msg or f"HTTP {resp.status_code}"})
             if delay:
@@ -754,6 +792,12 @@ async def delete_posts(req: DeleteRequest):
     if req.session_id not in SESSIONS:
         raise HTTPException(status_code=404, detail="Session expired")
     req.post_ids = list(dict.fromkeys(req.post_ids))  # buang duplikat, urutan tetap
+    # Job lama yang masih jalan di background (mis. halaman di-refresh) dan
+    # menangani postingan yang sama dibatalkan, supaya tidak terus makan kuota.
+    new_ids = set(req.post_ids)
+    for old in DELETE_JOBS.values():
+        if old["status"] == "running" and old.get("ids") and (old["ids"] & new_ids):
+            old["cancel"] = True
     job_id = "del_" + secrets.token_urlsafe(8)
     DELETE_JOBS[job_id] = {
         "job_id": job_id, "status": "running", "total": len(req.post_ids),
@@ -761,6 +805,7 @@ async def delete_posts(req: DeleteRequest):
         "concurrency": max(1, min(int(req.concurrency or 3), 5)),
         "dry_run": req.dry_run, "created": time.time(),
         "error": None, "cancel": False, "remaining": [],
+        "ids": new_ids, "session_id": req.session_id, "log": [], "last_error": None,
     }
     asyncio.create_task(run_delete_job(job_id, req))
     return {"job_id": job_id, "total": len(req.post_ids), "status": "running"}
@@ -780,6 +825,9 @@ async def delete_progress(job_id: str):
         "remaining": [] if running else list(job.get("remaining", [])),
         "cooldown_remaining": int(_cooldown_remaining()),
         "usage_pct": FB_USAGE_PCT,
+        "message": _status_message(job),
+        "last_error": job.get("last_error"),
+        "log": job.get("log", [])[-30:],
         "error": job.get("error"),
     }
 
@@ -805,8 +853,48 @@ async def usage():
 
 @app.post("/api/logout")
 async def logout(session_id: str = Form(...)):
+    for j in DELETE_JOBS.values():
+        if j.get("session_id") == session_id and j["status"] == "running":
+            j["cancel"] = True
     SESSIONS.pop(session_id, None)
     return {"ok": True}
+
+
+@app.get("/api/debug")
+async def debug_info():
+    """Ringkasan semua job delete yang berjalan (tanpa token)."""
+    jobs = []
+    for j in DELETE_JOBS.values():
+        jobs.append({
+            "job_id": j["job_id"], "status": j["status"], "message": _status_message(j),
+            "completed": j["completed"], "total": j["total"],
+            "success": j["success"], "failed": j["failed"],
+            "concurrency": j["concurrency"], "dry_run": j["dry_run"],
+            "last_error": j.get("last_error"), "log": j.get("log", [])[-15:],
+            "age_sec": int(time.time() - j.get("created", time.time())),
+        })
+    jobs.sort(key=lambda x: x["age_sec"])
+    return {
+        "usage_pct": FB_USAGE_PCT,
+        "cooldown_remaining": int(_cooldown_remaining()),
+        "headers": FB_USAGE,
+        "jobs": jobs[:10],
+    }
+
+
+DEBUG_HTML = """<!doctype html><meta charset=utf-8><title>Debug</title>
+<body style="font:14px monospace;background:#111827;color:#d1fae5;padding:16px">
+<h3>Status Limit &amp; Job Hapus (auto refresh 2 dtk)</h3><pre id=o>memuat...</pre>
+<script>
+async function t(){try{const r=await fetch('/api/debug');
+document.getElementById('o').textContent=JSON.stringify(await r.json(),null,2)}catch(e){}}
+t();setInterval(t,2000);
+</script></body>"""
+
+
+@app.get("/debug", response_class=HTMLResponse)
+async def debug_page():
+    return HTMLResponse(DEBUG_HTML)
 
 
 if __name__ == "__main__":
