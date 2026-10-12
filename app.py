@@ -118,6 +118,7 @@ async def get_posts(session_id: str, page_id: str, limit: int = 50, since: Optio
     posts, seen, visited = [], set(), set()
     warning = None
 
+    # 1. Postingan biasa
     url = f"{BASE_URL}/{page_id}/posts"
     params = {"fields": fields, "limit": 100, "access_token": page_token}
     if since:
@@ -155,12 +156,14 @@ async def get_posts(session_id: str, page_id: str, limit: int = 50, since: Optio
                     continue
                 if post_id not in seen:
                     seen.add(post_id)
+                    p["type"] = "post"  # tandai sebagai post biasa
                     posts.append(p)
                     if len(posts) >= limit:
                         break
             url = (data.get("paging") or {}).get("next")
             params = None
 
+        # 2. Reels — ditandai jelas
         if len(posts) < limit:
             reels_url = f"{BASE_URL}/{page_id}/video_reels"
             reels_params = {
@@ -186,11 +189,14 @@ async def get_posts(session_id: str, page_id: str, limit: int = 50, since: Optio
                             "permalink_url": None,
                             "full_picture": None,
                             "status_type": "reel",
+                            "type": "reel",          # ← penanda Reels
                         })
                         if len(posts) >= limit:
                             break
-            except Exception:
-                pass
+                elif isinstance(data, dict) and "error" in data:
+                    warning = (warning or "") + " | Reels: " + data["error"].get("message", "error")
+            except Exception as e:
+                warning = (warning or "") + f" | Reels error: {e}"
 
     return {
         "page_id": page_id,
@@ -200,7 +206,6 @@ async def get_posts(session_id: str, page_id: str, limit: int = 50, since: Optio
         "limit_reached": len(posts) >= limit,
         "warning": warning,
     }
-
 
 # ===================== DELETE (tidak diubah) =====================
 DELETE_JOBS: Dict[str, Dict[str, Any]] = {}
