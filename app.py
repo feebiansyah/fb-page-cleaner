@@ -73,6 +73,33 @@ async def login(token: str = Form(...)):
     }
 
 
+async def get_stories_post_ids(page_id: str, page_token: str) -> set:
+    story_ids = set()
+    url = f"{BASE_URL}/{page_id}/stories"
+    params = {"fields": "post_id", "limit": 100, "access_token": page_token}
+    visited = set()
+    first = True
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        while url and url not in visited:
+            visited.add(url)
+            try:
+                r = await client.get(url, params=params if first else None)
+                first = False
+                data = r.json()
+                if not isinstance(data, dict) or "error" in data:
+                    break
+                for item in data.get("data", []):
+                    pid = item.get("post_id")
+                    if pid:
+                        story_ids.add(str(pid))
+                url = (data.get("paging") or {}).get("next")
+                params = None
+            except Exception:
+                break
+    return story_ids
+
+
 @app.get("/api/posts/{session_id}/{page_id}")
 async def get_posts(session_id: str, page_id: str, limit: int = 50, since: Optional[str] = None, until: Optional[str] = None):
     if limit < 1 or limit > 10000:
@@ -85,13 +112,18 @@ async def get_posts(session_id: str, page_id: str, limit: int = 50, since: Optio
         raise HTTPException(status_code=400, detail="Page token tidak ditemukan")
 
     page_token = page["access_token"]
+    story_ids = await get_stories_post_ids(page_id, page_token)
+
     fields = "id,message,created_time,permalink_url,status_type,full_picture,attachments{media_type,media,type,title,description,url,subattachments}"
     posts, seen, visited = [], set(), set()
     warning = None
+
     url = f"{BASE_URL}/{page_id}/posts"
     params = {"fields": fields, "limit": 100, "access_token": page_token}
-    if since: params["since"] = since
-    if until: params["until"] = until
+    if since:
+        params["since"] = since
+    if until:
+        params["until"] = until
     first = True
 
     async with httpx.AsyncClient(timeout=45.0) as client:
@@ -115,104 +147,60 @@ async def get_posts(session_id: str, page_id: str, limit: int = 50, since: Optio
                 warning = (data.get("error") or {}).get("message", "API error")
                 break
             for p in data.get("data", []):
-                if isinstance(p, dict) and p.get("id") and p["id"] not in seen:
-                    seen.add(p["id"])
+                if not isinstance(p, dict) or not p.get("id"):
+                    continue
+                post_id = str(p["id"])
+                post_part = post_id.split("_")[-1] if "_" in post_id else post_id
+                if post_id in story_ids or post_part in story_ids:
+                    continue
+                if post_id not in seen:
+                    seen.add(post_id)
                     posts.append(p)
                     if len(posts) >= limit:
                         break
             url = (data.get("paging") or {}).get("next")
             params = None
 
-    return {"page_id": page_id, "posts": posts, "count": len(posts), "requested_limit": limit, "limit_reached": len(posts) >= limit, "warning": warning}
-
-
-@app.get("/api/videos/{session_id}/{page_id}")
-async def get_videos(session_id: str, page_id: str, limit: int = 50):
-    """Ambil video post biasa. Story di-skip berdasarkan URL."""
-    if limit < 1 or limit > 10000:
-        raise HTTPException(status_code=400, detail="Limit harus 1-10000")
-
-    sess = SESSIONS.get(session_id)
-    if not sess:
-        raise HTTPException(status_code=404, detail="Session expired")
-
-    page = next((p for p in sess["pages"] if str(p.get("id")) == str(page_id)), None)
-    if not page or not page.get("access_token"):
-        raise HTTPException(status_code=400, detail="Page token tidak ditemukan")
-
-    page_token = page["access_token"]
-    videos = []
-    seen = set()
-    warning = None
-
-    url = f"{BASE_URL}/{page_id}/videos"
-    params = {
-        "fields": "id,title,description,created_time,permalink_url,picture",
-        "limit": 100,
-        "access_token": page_token,
-    }
-    visited = set()
-    first = True
-
-    async with httpx.AsyncClient(timeout=45.0) as client:
-        while url and len(videos) < limit:
-            if url in visited:
-                break
-            visited.add(url)
-
+        if len(posts) < limit:
+            reels_url = f"{BASE_URL}/{page_id}/video_reels"
+            reels_params = {
+                "fields": "id,description,updated_time",
+                "limit": 50,
+                "access_token": page_token,
+            }
             try:
-                r = await client.get(url, params=params if first else None)
-            except Exception as e:
-                warning = f"Koneksi error: {type(e).__name__}"
-                break
-            first = False
-
-            try:
+                r = await client.get(reels_url, params=reels_params)
                 data = r.json()
+                if isinstance(data, dict) and "error" not in data:
+                    for item in data.get("data", []):
+                        if not isinstance(item, dict) or not item.get("id"):
+                            continue
+                        vid = str(item["id"])
+                        if vid in seen:
+                            continue
+                        seen.add(vid)
+                        posts.append({
+                            "id": vid,
+                            "message": item.get("description") or "(Reel)",
+                            "created_time": item.get("updated_time"),
+                            "permalink_url": None,
+                            "full_picture": None,
+                            "status_type": "reel",
+                        })
+                        if len(posts) >= limit:
+                            break
             except Exception:
-                warning = "Respons bukan JSON"
-                break
-
-            if not isinstance(data, dict) or "error" in data:
-                err = data.get("error", {}) if isinstance(data, dict) else {}
-                warning = err.get("message", "Meta API error")
-                break
-
-            for item in data.get("data", []):
-                if not isinstance(item, dict) or not item.get("id"):
-                    continue
-
-                # Skip jika URL mengandung /stories/ (ini cerita)
-                permalink = item.get("permalink_url") or ""
-                if "/stories/" in permalink.lower():
-                    continue
-
-                vid = str(item["id"])
-                if vid in seen:
-                    continue
-                seen.add(vid)
-
-                videos.append({
-                    "id": vid,
-                    "message": item.get("title") or item.get("description") or "(video)",
-                    "created_time": item.get("created_time"),
-                    "permalink_url": item.get("permalink_url"),
-                    "full_picture": item.get("picture"),
-                    "status_type": "video",
-                })
-                if len(videos) >= limit:
-                    break
-
-            url = (data.get("paging") or {}).get("next")
-            params = None
+                pass
 
     return {
         "page_id": page_id,
-        "posts": videos,
-        "count": len(videos),
+        "posts": posts,
+        "count": len(posts),
         "requested_limit": limit,
+        "limit_reached": len(posts) >= limit,
         "warning": warning,
     }
+
 
 # ===================== DELETE (tidak diubah) =====================
 DELETE_JOBS: Dict[str, Dict[str, Any]] = {}
