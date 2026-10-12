@@ -1,39 +1,50 @@
 """
-Facebook Page Post Bulk Cleaner
-Versi aman - token hanya hidup di memory server lokal.
-Jalankan di mesin kamu sendiri.
+FB Page Cleaner - versi lama + tambahan Reels (minimal).
+Perubahan ditandai komentar [REELS].
 """
 
 import asyncio
+import os
+import re
+import secrets
 import time
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 
 import httpx
 from fastapi import FastAPI, Request, Form, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 app = FastAPI(title="FB Page Cleaner")
 templates = Jinja2Templates(directory="templates")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# In-memory storage (hanya selama server hidup)
-SESSIONS: Dict[str, Dict] = {}  # session_id -> {user_token, pages, etc}
+SESSIONS: Dict[str, Dict] = {}
 
-GRAPH_VERSION = "v26.0"
+GRAPH_VERSION = os.environ.get("GRAPH_VERSION", "v26.0")
 BASE_URL = f"https://graph.facebook.com/{GRAPH_VERSION}"
+FB_WEB = "https://www.facebook.com"
+
+# [REELS] field ringan untuk Reels (fallback jika field pertama ditolak)
+REEL_FIELDS_TRY = (
+    "id,description,created_time,updated_time,picture,permalink_url",
+    "id,description,updated_time",
+)
+_REEL_ID_RE = re.compile(r"/(?:reels?|videos?)/(\d+)")
 
 
 class DeleteRequest(BaseModel):
     session_id: str
-    post_ids: List[str]  # list of "pageid_postid" or just post ids with page mapping
-    page_tokens: Dict[str, str]  # post_id -> page_token
+    post_ids: List[str]
+    # [REELS] post_id -> page_id (wajib untuk Reels karena ID-nya tanpa prefix "pageid_")
+    post_pages: Dict[str, str] = Field(default_factory=dict)
+    page_tokens: Dict[str, str] = Field(default_factory=dict)
     dry_run: bool = True
     delay_ms: int = 800
-    concurrency: int = 3  # jumlah DELETE bersamaan; dibatasi server maksimal 5
+    concurrency: int = 3  # dibatasi server maksimal 5
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -62,13 +73,12 @@ async def login(token: str = Form(...)):
                 raise HTTPException(400, data["error"].get("message", "Token error"))
 
             pages = data.get("data", [])
-            # Pagination sederhana jika ada banyak page
             while "paging" in data and "next" in data["paging"]:
                 r = await client.get(data["paging"]["next"])
                 data = r.json()
                 pages.extend(data.get("data", []))
 
-            session_id = f"sess_{int(time.time())}"
+            session_id = "sess_" + secrets.token_urlsafe(16)
             SESSIONS[session_id] = {
                 "user_token": token,
                 "pages": pages,
@@ -89,6 +99,42 @@ async def login(token: str = Form(...)):
             }
         except httpx.HTTPError as e:
             raise HTTPException(500, f"Network error: {str(e)}")
+
+
+# [REELS] ambil Reels: satu loop paginasi sederhana, tanpa retry / jendela waktu
+async def fetch_reels(client: httpx.AsyncClient, page_id: str, token: str, limit: int):
+    last_err = None
+    for fields in REEL_FIELDS_TRY:
+        reels: List[dict] = []
+        url: Optional[str] = f"{BASE_URL}/{page_id}/video_reels"
+        params: Optional[dict] = {"fields": fields, "limit": 25, "access_token": token}
+        try:
+            while url and len(reels) < limit:
+                r = await client.get(url, params=params)
+                data = r.json()
+                if "error" in data:
+                    raise ValueError(data["error"].get("message", "Reels error"))
+                reels.extend(x for x in data.get("data", []) if isinstance(x, dict))
+                url = (data.get("paging") or {}).get("next")
+                params = None
+            return reels[:limit], None
+        except Exception as e:
+            last_err = str(e)
+    return [], last_err
+
+
+def _abs_url(u: Optional[str]) -> Optional[str]:
+    if not u:
+        return None
+    return u if u.startswith("http") else FB_WEB + u
+
+
+def _reel_ids_in_post(p: dict) -> set:
+    """[REELS] kumpulkan ID video/reel yang terkait sebuah post feed (untuk dedup)."""
+    ids = set(_REEL_ID_RE.findall(p.get("permalink_url") or ""))
+    for a in (p.get("attachments") or {}).get("data", []) or []:
+        ids.update(_REEL_ID_RE.findall(a.get("url") or ""))
+    return ids
 
 
 @app.get("/api/posts/{session_id}/{page_id}")
@@ -119,6 +165,7 @@ async def get_posts(
 
     posts = []
     seen = set()
+    warning = None
     async with httpx.AsyncClient(timeout=30.0) as client:
         url = f"{BASE_URL}/{page_id}/posts"
         while url and len(posts) < limit:
@@ -133,7 +180,45 @@ async def get_posts(
             url = data.get("paging", {}).get("next")
             params = None
 
-    return {"posts": posts, "count": len(posts)}
+        # [REELS] ambil Reels, gagal pun postingan biasa tetap tampil
+        raw_reels, reel_err = await fetch_reels(client, page_id, page["access_token"], limit)
+        if reel_err:
+            warning = f"Reels gagal diambil: {reel_err}"
+
+    # [REELS] normalisasi Reels + filter tanggal (sisi klien)
+    reels = []
+    reel_ids = set()
+    for rl in raw_reels:
+        rid = str(rl.get("id", ""))
+        if not rid:
+            continue
+        created = rl.get("created_time") or rl.get("updated_time") or ""
+        day = created[:10]
+        if since and day and day < since:
+            continue
+        if until and day and day > until:
+            continue
+        reel_ids.add(rid)
+        reels.append({
+            "id": rid,
+            "message": rl.get("description") or "(Reel)",
+            "created_time": created,
+            "permalink_url": _abs_url(rl.get("permalink_url")) or f"{FB_WEB}/reel/{rid}",
+            "full_picture": rl.get("picture"),
+            "type": "reel",
+        })
+
+    # [REELS] buang post feed yang sebenarnya Reel yang sama
+    merged = []
+    for p in posts:
+        if (_reel_ids_in_post(p) & reel_ids) or (str(p["id"]).split("_")[-1] in reel_ids):
+            continue
+        p["type"] = "post"
+        merged.append(p)
+    merged.extend(reels)
+    merged.sort(key=lambda x: x.get("created_time") or "", reverse=True)
+
+    return {"posts": merged, "count": len(merged), "warning": warning}
 
 
 DELETE_JOBS: Dict[str, Dict[str, Any]] = {}
@@ -146,7 +231,7 @@ async def run_delete_job(job_id: str, req: DeleteRequest):
         job.update({"status": "error", "error": "Session expired"})
         return
 
-    page_token_by_id = {p["id"]: p.get("access_token") for p in sess["pages"]}
+    page_token_by_id = {str(p["id"]): p.get("access_token") for p in sess["pages"]}
     concurrency = max(1, min(int(req.concurrency or 3), 5))
     delay_seconds = max(0, min(int(req.delay_ms or 0), 60000)) / 1000.0
     semaphore = asyncio.Semaphore(concurrency)
@@ -154,8 +239,9 @@ async def run_delete_job(job_id: str, req: DeleteRequest):
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         async def process_one(post_id: str) -> Dict[str, Any]:
-            page_id = post_id.split("_")[0] if "_" in post_id else None
-            page_token = page_token_by_id.get(page_id) or req.page_tokens.get(post_id)
+            # [REELS] pakai mapping dari frontend dulu, baru prefix ID
+            page_id = req.post_pages.get(post_id) or (post_id.split("_")[0] if "_" in post_id else None)
+            page_token = page_token_by_id.get(str(page_id)) or req.page_tokens.get(post_id)
             if not page_token:
                 result = {"post_id": post_id, "success": False, "error": "Page token tidak ditemukan"}
             elif req.dry_run:
@@ -183,7 +269,6 @@ async def run_delete_job(job_id: str, req: DeleteRequest):
                     if delay_seconds:
                         await asyncio.sleep(delay_seconds)
 
-            # Update small in-memory counters as each item finishes; no extra Meta API calls.
             job["results"].append(result)
             job["completed"] += 1
             if result.get("success"):
@@ -202,7 +287,7 @@ async def run_delete_job(job_id: str, req: DeleteRequest):
 async def delete_posts(req: DeleteRequest):
     if req.session_id not in SESSIONS:
         raise HTTPException(404, "Session expired")
-    job_id = f"del_{int(time.time() * 1000)}_{len(DELETE_JOBS)}"
+    job_id = "del_" + secrets.token_urlsafe(8)
     DELETE_JOBS[job_id] = {
         "job_id": job_id, "status": "running", "total": len(req.post_ids),
         "completed": 0, "success": 0, "failed": 0, "results": [],
@@ -218,7 +303,6 @@ async def delete_progress(job_id: str):
     job = DELETE_JOBS.get(job_id)
     if not job:
         raise HTTPException(404, "Delete job not found")
-    # Return a snapshot; no network calls and negligible CPU/memory overhead.
     return {
         "job_id": job["job_id"], "status": job["status"], "total": job["total"],
         "completed": job["completed"], "success": job["success"], "failed": job["failed"],
@@ -239,7 +323,6 @@ async def get_ads_protected_posts(session_id: str):
     ad_accounts = []
 
     async with httpx.AsyncClient(timeout=40.0) as client:
-        # 1. Ambil ad accounts
         try:
             r = await client.get(
                 f"{BASE_URL}/me/adaccounts",
@@ -252,7 +335,6 @@ async def get_ads_protected_posts(session_id: str):
         except Exception as e:
             return {"protected_posts": [], "warning": str(e), "ad_accounts": []}
 
-        # 2. Untuk setiap ad account, ambil ads yang ACTIVE atau PAUSED
         for acc in ad_accounts:
             acc_id = acc["id"]
             try:
@@ -274,14 +356,12 @@ async def get_ads_protected_posts(session_id: str):
                             sid = creative.get(key)
                             if sid and "_" in str(sid):
                                 protected.add(str(sid))
-                                # Tambahan: simpan juga bagian post ID saja (setelah _)
                                 post_part = str(sid).split("_", 1)[-1]
                                 if post_part:
                                     protected.add(post_part)
                     url = data.get("paging", {}).get("next")
                     params = None
 
-                # Tambahan: ambil juga dari endpoint adcreatives langsung (lebih lengkap)
                 try:
                     url2 = f"{BASE_URL}/{acc_id}/adcreatives"
                     params2 = {
@@ -324,4 +404,4 @@ async def logout(session_id: str = Form(...)):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
