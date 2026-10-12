@@ -1,8 +1,11 @@
 import asyncio
+import hashlib
+import json
 import os
 import secrets
 import time
 from datetime import datetime
+from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional, Set
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
@@ -11,7 +14,7 @@ from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 app = FastAPI(title="FB Page Cleaner")
 templates = Jinja2Templates(directory="templates")
@@ -31,11 +34,31 @@ REEL_FIELDS_TRY = (
     "id,description,updated_time",
 )
 RATE_LIMIT_CODES = {2, 4, 17, 32, 341, 613, 80001, 80004}
+LIMIT_CODES = {4, 17, 32, 613, 80001, 80004}
 WINDOW_SECONDS = 90 * 86400
 SPLIT_THRESHOLD = 400
 MAX_EMPTY_WINDOWS = 6
 PASS_B_MIN = 90
-MIN_TS = 1075593600            # 2004-02-01
+MIN_TS = 1075593600  # 2004-02-01
+
+# Optimasi:
+# - Cache daftar Page singkat agar login berulang dari device berbeda tidak selalu
+#   memanggil /me/accounts. Set 0 untuk menonaktifkan cache.
+# - Semaphore membatasi request aktif dalam satu proses, tetap default 5.
+# - Cooldown global proses ketika Graph API memberi rate-limit.
+ACCOUNTS_CACHE_TTL = max(0, int(os.environ.get("ACCOUNTS_CACHE_TTL", "60")))
+FB_MAX_INFLIGHT = max(1, min(5, int(os.environ.get("FB_MAX_INFLIGHT", "5"))))
+ACCOUNTS_CACHE: Dict[str, Dict[str, Any]] = {}
+ACCOUNTS_CACHE_LOCK = asyncio.Lock()
+FB_REQUEST_SEMAPHORE = asyncio.Semaphore(FB_MAX_INFLIGHT)
+FB_COOLDOWN_LOCK = asyncio.Lock()
+FB_COOLDOWN_UNTIL = 0.0
+FB_USAGE: Dict[str, Any] = {
+    "x-app-usage": None,
+    "x-business-use-case-usage": None,
+    "last_rate_limit_at": None,
+    "last_rate_limit_code": None,
+}
 
 
 class FBError(Exception):
@@ -48,8 +71,8 @@ class FBError(Exception):
 class DeleteRequest(BaseModel):
     session_id: str
     post_ids: List[str]
-    post_pages: Dict[str, str] = {}
-    page_tokens: Dict[str, str] = {}
+    post_pages: Dict[str, str] = Field(default_factory=dict)
+    page_tokens: Dict[str, str] = Field(default_factory=dict)
     dry_run: bool = True
     delay_ms: int = 300
     concurrency: int = 3
@@ -58,38 +81,127 @@ class DeleteRequest(BaseModel):
 class LoadRequest(BaseModel):
     session_id: str
     page_ids: List[str]
-    limit: int = 0   # 0 = ambil semua
+    limit: int = 0  # 0 = ambil semua
 
 
-# ------------------------------------------------------------------ helpers
+# ------------------------------------------------------------------ API helpers
 def too_much_data(msg: str, code: Optional[int]) -> bool:
     return "reduce the amount" in (msg or "").lower() or code == 1
 
 
-async def fb_get(client: httpx.AsyncClient, url: str, params: Optional[dict] = None) -> dict:
+def _token_cache_key(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _record_usage_headers(headers) -> None:
+    """Simpan statistik penggunaan yang dikirim Meta, tanpa mencatat access token."""
+    for header in ("x-app-usage", "x-business-use-case-usage"):
+        raw = headers.get(header)
+        if raw:
+            try:
+                FB_USAGE[header] = json.loads(raw)
+            except (TypeError, ValueError):
+                FB_USAGE[header] = {"raw": raw[:1000]}
+
+
+def _retry_after_seconds(response: httpx.Response) -> Optional[float]:
+    value = response.headers.get("Retry-After")
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        try:
+            return max(0.0, parsedate_to_datetime(value).timestamp() - time.time())
+        except Exception:
+            return None
+
+
+async def _wait_for_cooldown() -> None:
+    while True:
+        async with FB_COOLDOWN_LOCK:
+            wait = FB_COOLDOWN_UNTIL - time.time()
+        if wait <= 0:
+            return
+        await asyncio.sleep(min(wait, 5.0))
+
+
+async def _set_cooldown(seconds: float, code: Optional[int]) -> None:
+    global FB_COOLDOWN_UNTIL
+    seconds = max(1.0, min(float(seconds), 300.0))
+    async with FB_COOLDOWN_LOCK:
+        FB_COOLDOWN_UNTIL = max(FB_COOLDOWN_UNTIL, time.time() + seconds)
+        FB_USAGE["last_rate_limit_at"] = datetime.now().isoformat()
+        FB_USAGE["last_rate_limit_code"] = code
+
+
+async def fb_get(
+    client: httpx.AsyncClient,
+    url: str,
+    params: Optional[dict] = None,
+) -> dict:
+    """GET Graph API dengan retry terbatas dan cooldown bersama dalam proses."""
     last_msg = "Unknown error"
     last_code = None
+
     for attempt in range(5):
+        await _wait_for_cooldown()
+        response = None
         try:
-            r = await client.get(url, params=params)
-            data = r.json()
-        except Exception as exc:
+            async with FB_REQUEST_SEMAPHORE:
+                response = await client.get(url, params=params)
+            _record_usage_headers(response.headers)
+            try:
+                data = response.json()
+            except ValueError:
+                data = {}
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
             last_msg = str(exc) or exc.__class__.__name__
-            await asyncio.sleep(1.0 * (attempt + 1))
-            continue
-        if isinstance(data, dict) and "error" in data:
-            err = data["error"] or {}
-            last_msg = err.get("message", "API error")
-            last_code = err.get("code")
-            if too_much_data(last_msg, last_code):
-                raise FBError(last_msg, last_code)
-            if last_code in RATE_LIMIT_CODES or err.get("is_transient"):
-                await asyncio.sleep(min(30, 2 * (attempt + 1) ** 2))
+            if attempt < 4:
+                await asyncio.sleep(min(8.0, 0.5 * (2 ** attempt)))
                 continue
             raise FBError(last_msg, last_code)
+        except Exception as exc:
+            last_msg = str(exc) or exc.__class__.__name__
+            if attempt < 4:
+                await asyncio.sleep(min(8.0, 0.5 * (2 ** attempt)))
+                continue
+            raise FBError(last_msg, last_code)
+
+        if isinstance(data, dict) and "error" in data:
+            err = data.get("error") or {}
+            last_msg = err.get("message", "API error")
+            last_code = err.get("code")
+
+            # Biarkan fetch_all mengecilkan page size untuk error ukuran data.
+            if too_much_data(last_msg, last_code):
+                raise FBError(last_msg, last_code)
+
+            if last_code in RATE_LIMIT_CODES or err.get("is_transient"):
+                if attempt >= 4:
+                    break
+                retry_after = _retry_after_seconds(response) if response else None
+                if retry_after is not None:
+                    wait_seconds = retry_after
+                elif last_code in RATE_LIMIT_CODES:
+                    wait_seconds = min(120.0, 5.0 * (2 ** attempt))
+                else:
+                    wait_seconds = min(30.0, 2.0 * (2 ** attempt))
+
+                if last_code in RATE_LIMIT_CODES:
+                    await _set_cooldown(wait_seconds, last_code)
+                else:
+                    await asyncio.sleep(wait_seconds)
+                continue
+
+            raise FBError(last_msg, last_code)
+
+        if response is not None and response.is_error and not isinstance(data, dict):
+            raise FBError(f"HTTP {response.status_code}")
         if not isinstance(data, dict):
             raise FBError("Response bukan JSON object")
         return data
+
     raise FBError(last_msg, last_code)
 
 
@@ -100,8 +212,14 @@ def set_limit(url: str, limit: int) -> str:
     return urlunparse(p._replace(query=urlencode(q)))
 
 
-async def fetch_all(client: httpx.AsyncClient, url: str, params: dict,
-                    page_size: int = 100, max_items: int = 0, on_items=None) -> List[dict]:
+async def fetch_all(
+    client: httpx.AsyncClient,
+    url: str,
+    params: dict,
+    page_size: int = 100,
+    max_items: int = 0,
+    on_items=None,
+) -> List[dict]:
     """Ambil semua halaman dari satu edge sampai habis (atau sampai max_items)."""
     items: List[dict] = []
     cur_url: Optional[str] = url
@@ -126,6 +244,7 @@ async def fetch_all(client: httpx.AsyncClient, url: str, params: dict,
                     cur_url = set_limit(cur_url, page_size)
                 continue
             raise
+
         batch = [x for x in data.get("data", []) if isinstance(x, dict)]
         items.extend(batch)
         if on_items:
@@ -194,7 +313,8 @@ async def load_page_posts(client, page: dict, job: dict, limit: int = 0) -> List
         try:
             raw = await fetch_all(
                 client, url, {"fields": POST_FIELDS, "access_token": token},
-                max_items=limit, on_items=lambda n: (counts.__setitem__("posts", n), sync()),
+                max_items=limit,
+                on_items=lambda n: (counts.__setitem__("posts", n), sync()),
             )
             a_ok = True
             log(f"Postingan (Pass A): {len(raw)}")
@@ -204,7 +324,7 @@ async def load_page_posts(client, page: dict, job: dict, limit: int = 0) -> List
 
         by_id: Dict[str, dict] = {str(p["id"]): p for p in raw if p.get("id")}
 
-        # Pass B hanya jika kemungkinan terpotong
+        # Logika Pass B dipertahankan seperti versi awal.
         if (not limit or len(by_id) < limit) and (not a_ok or len(raw) >= PASS_B_MIN):
             until = int(time.time()) + 86400
             if a_ok:
@@ -281,7 +401,7 @@ async def load_page_posts(client, page: dict, job: dict, limit: int = 0) -> List
         if not pid:
             continue
         if collect_targets(p) & reel_ids or pid.split("_")[-1] in reel_ids:
-            dup += 1          # sudah ada sebagai Reel
+            dup += 1
             continue
         p["type"] = "post"
         p["permalink_url"] = abs_url(p.get("permalink_url"))
@@ -342,24 +462,50 @@ async def index(request: Request):
 async def login(token: str = Form(...)):
     if not token or len(token) < 50:
         raise HTTPException(status_code=400, detail="Token tidak valid")
-    pages: List[dict] = []
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            items = await fetch_all(client, f"{BASE_URL}/me/accounts", {
-                "fields": "id,name,access_token,category,tasks", "access_token": token,
-            })
-            pages.extend(items)
-    except FBError as e:
-        raise HTTPException(status_code=400, detail=e.message)
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=str(exc))
 
+    cache_key = _token_cache_key(token)
+    pages = None
+    now = time.time()
+
+    if ACCOUNTS_CACHE_TTL > 0:
+        async with ACCOUNTS_CACHE_LOCK:
+            cached = ACCOUNTS_CACHE.get(cache_key)
+            if cached and now - cached["time"] < ACCOUNTS_CACHE_TTL:
+                pages = cached["pages"]
+
+    if pages is None:
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                pages = await fetch_all(client, f"{BASE_URL}/me/accounts", {
+                    "fields": "id,name,access_token,category,tasks", "access_token": token,
+                })
+        except FBError as e:
+            raise HTTPException(status_code=400, detail=e.message)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc))
+
+        if ACCOUNTS_CACHE_TTL > 0:
+            async with ACCOUNTS_CACHE_LOCK:
+                ACCOUNTS_CACHE[cache_key] = {"time": time.time(), "pages": pages}
+                cutoff = time.time() - ACCOUNTS_CACHE_TTL
+                for key in list(ACCOUNTS_CACHE):
+                    if ACCOUNTS_CACHE[key]["time"] < cutoff:
+                        ACCOUNTS_CACHE.pop(key, None)
+
+    session_pages = [dict(p) for p in pages]
     session_id = "sess_" + secrets.token_urlsafe(16)
-    SESSIONS[session_id] = {"user_token": token, "pages": pages, "created": datetime.now().isoformat()}
+    SESSIONS[session_id] = {
+        "user_token": token,
+        "pages": session_pages,
+        "created": datetime.now().isoformat(),
+    }
     return {
         "session_id": session_id,
-        "pages": [{"id": p["id"], "name": p["name"], "category": p.get("category", ""),
-                   "has_token": bool(p.get("access_token"))} for p in pages],
+        "pages": [{
+            "id": p["id"], "name": p["name"],
+            "category": p.get("category", ""),
+            "has_token": bool(p.get("access_token")),
+        } for p in session_pages],
     }
 
 
@@ -392,9 +538,6 @@ async def load_progress(job_id: str):
         "warnings": job["warnings"], "error": job["error"],
         "posts": job["posts"] if done else [],
     }
-
-
-LIMIT_CODES = {4, 17, 32, 613, 80001, 80004}
 
 
 async def run_delete_job(job_id: str, req: DeleteRequest):
@@ -430,18 +573,24 @@ async def run_delete_job(job_id: str, req: DeleteRequest):
                 return
 
             result = None
-            for _ in range(8):
+            for attempt in range(8):
                 if state["abort"]:
                     return
-                wait = state["cooldown_until"] - time.time()
-                if wait > 0:
-                    await asyncio.sleep(wait)
+                # Tunggu cooldown bersama untuk GET dan DELETE.
+                await _wait_for_cooldown()
+                local_wait = state["cooldown_until"] - time.time()
+                if local_wait > 0:
+                    await asyncio.sleep(local_wait)
                     if state["abort"]:
                         return
 
                 async with sem:
                     try:
-                        resp = await client.delete(f"{BASE_URL}/{post_id}", params={"access_token": token})
+                        async with FB_REQUEST_SEMAPHORE:
+                            resp = await client.delete(
+                                f"{BASE_URL}/{post_id}", params={"access_token": token}
+                            )
+                        _record_usage_headers(resp.headers)
                         try:
                             data = resp.json()
                         except ValueError:
@@ -454,25 +603,34 @@ async def run_delete_job(job_id: str, req: DeleteRequest):
 
                 err = (data.get("error") or {}) if isinstance(data, dict) else {}
                 if err.get("code") in LIMIT_CODES:
-                    # hanya hitung sekali per gelombang limit
                     if time.time() >= state["cooldown_until"]:
                         state["hits"] += 1
                         if state["hits"] >= 4:
                             state["abort"] = True
-                            job["error"] = ("Limit aplikasi Facebook tercapai. Proses dihentikan. "
-                                            "Tunggu 30-60 menit lalu coba lagi dengan Paralel 1 dan Delay 1000 ms.")
+                            job["error"] = (
+                                "Limit aplikasi Facebook tercapai. Proses dihentikan. "
+                                "Tunggu 30-60 menit lalu coba lagi dengan Paralel 1 dan Delay 1000 ms."
+                            )
+                            await _set_cooldown(120, err.get("code"))
                             return
-                        state["cooldown_until"] = time.time() + 120 * state["hits"]
-                    continue  # coba lagi item yang sama setelah jeda
+                        local_cooldown = 120 * state["hits"]
+                        state["cooldown_until"] = time.time() + local_cooldown
+                        await _set_cooldown(local_cooldown, err.get("code"))
+                    continue
 
                 state["hits"] = 0
                 ok = resp.is_success and isinstance(data, dict) and bool(data.get("success"))
-                result = {"post_id": post_id, "success": ok,
-                          "error": None if ok else err.get("message", "Gagal")}
+                result = {
+                    "post_id": post_id, "success": ok,
+                    "error": None if ok else err.get("message", "Gagal"),
+                }
                 break
 
             if result is None:
-                result = {"post_id": post_id, "success": False, "error": "Gagal setelah beberapa percobaan"}
+                result = {
+                    "post_id": post_id, "success": False,
+                    "error": "Gagal setelah beberapa percobaan",
+                }
             record(result)
 
         try:
@@ -480,6 +638,7 @@ async def run_delete_job(job_id: str, req: DeleteRequest):
             job["status"] = "stopped" if state["abort"] else "completed"
         except Exception as exc:
             job.update(status="error", error=str(exc))
+
 
 @app.post("/api/delete")
 async def delete_posts(req: DeleteRequest):
@@ -491,6 +650,7 @@ async def delete_posts(req: DeleteRequest):
         "completed": 0, "success": 0, "failed": 0, "results": [],
         "concurrency": max(1, min(int(req.concurrency or 3), 5)),
         "dry_run": req.dry_run, "created": time.time(),
+        "error": None,
     }
     asyncio.create_task(run_delete_job(job_id, req))
     return {"job_id": job_id, "total": len(req.post_ids), "status": "running"}
