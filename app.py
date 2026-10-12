@@ -128,12 +128,14 @@ async def get_posts(session_id: str, page_id: str, limit: int = 50, since: Optio
 
 @app.get("/api/videos/{session_id}/{page_id}")
 async def get_videos(session_id: str, page_id: str, limit: int = 50):
-    """Load video posts biasa (bukan story)."""
+    """Ambil video post biasa. Story di-skip berdasarkan URL."""
     if limit < 1 or limit > 10000:
         raise HTTPException(status_code=400, detail="Limit harus 1-10000")
+
     sess = SESSIONS.get(session_id)
     if not sess:
         raise HTTPException(status_code=404, detail="Session expired")
+
     page = next((p for p in sess["pages"] if str(p.get("id")) == str(page_id)), None)
     if not page or not page.get("access_token"):
         raise HTTPException(status_code=400, detail="Page token tidak ditemukan")
@@ -143,10 +145,9 @@ async def get_videos(session_id: str, page_id: str, limit: int = 50):
     seen = set()
     warning = None
 
-    # Hanya pakai /videos (bukan stories)
     url = f"{BASE_URL}/{page_id}/videos"
     params = {
-        "fields": "id,title,description,created_time,permalink_url,picture,source",
+        "fields": "id,title,description,created_time,permalink_url,picture",
         "limit": 100,
         "access_token": page_token,
     }
@@ -158,37 +159,50 @@ async def get_videos(session_id: str, page_id: str, limit: int = 50):
             if url in visited:
                 break
             visited.add(url)
+
             try:
                 r = await client.get(url, params=params if first else None)
             except Exception as e:
-                warning = str(e)
+                warning = f"Koneksi error: {type(e).__name__}"
                 break
             first = False
+
             try:
                 data = r.json()
             except Exception:
-                warning = "Bukan JSON"
+                warning = "Respons bukan JSON"
                 break
+
             if not isinstance(data, dict) or "error" in data:
-                warning = (data.get("error") or {}).get("message", "API error")
+                err = data.get("error", {}) if isinstance(data, dict) else {}
+                warning = err.get("message", "Meta API error")
                 break
-            for v in data.get("data", []):
-                if not isinstance(v, dict) or not v.get("id"):
+
+            for item in data.get("data", []):
+                if not isinstance(item, dict) or not item.get("id"):
                     continue
-                vid = v["id"]
+
+                # Skip jika URL mengandung /stories/ (ini cerita)
+                permalink = item.get("permalink_url") or ""
+                if "/stories/" in permalink.lower():
+                    continue
+
+                vid = str(item["id"])
                 if vid in seen:
                     continue
                 seen.add(vid)
+
                 videos.append({
                     "id": vid,
-                    "message": v.get("title") or v.get("description") or "(video)",
-                    "created_time": v.get("created_time"),
-                    "permalink_url": v.get("permalink_url"),
-                    "full_picture": v.get("picture"),
+                    "message": item.get("title") or item.get("description") or "(video)",
+                    "created_time": item.get("created_time"),
+                    "permalink_url": item.get("permalink_url"),
+                    "full_picture": item.get("picture"),
                     "status_type": "video",
                 })
                 if len(videos) >= limit:
                     break
+
             url = (data.get("paging") or {}).get("next")
             params = None
 
@@ -199,7 +213,6 @@ async def get_videos(session_id: str, page_id: str, limit: int = 50):
         "requested_limit": limit,
         "warning": warning,
     }
-
 
 # ===================== DELETE (tidak diubah) =====================
 DELETE_JOBS: Dict[str, Dict[str, Any]] = {}
