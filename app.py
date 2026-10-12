@@ -4,6 +4,7 @@ Perubahan ditandai komentar [REELS].
 """
 
 import asyncio
+import json
 import os
 import re
 import secrets
@@ -224,6 +225,100 @@ async def get_posts(
 DELETE_JOBS: Dict[str, Dict[str, Any]] = {}
 
 
+# [LIMIT] kode error Facebook terkait rate limit; permintaan yang ditolak karena ini
+# belum dieksekusi, jadi aman diulang setelah menunggu.
+RATE_LIMIT_CODES = {4, 17, 32, 341, 613, 80001, 80004}
+BLOCK_CODES = {368}          # akun diblokir sementara -> hentikan semua
+MAX_RL_RETRIES = 3
+
+
+def usage_pct(headers) -> int:
+    """[LIMIT] baca persentase pemakaian kuota dari header Meta (X-App-Usage dll)."""
+    worst = 0
+    for h in ("x-app-usage", "x-page-usage", "x-business-use-case-usage"):
+        raw = headers.get(h)
+        if not raw:
+            continue
+        try:
+            d = json.loads(raw)
+        except ValueError:
+            continue
+        blocks = []
+        if isinstance(d, dict):
+            if any(isinstance(v, list) for v in d.values()):
+                for v in d.values():
+                    if isinstance(v, list):
+                        blocks.extend(x for x in v if isinstance(x, dict))
+            else:
+                blocks = [d]
+        for b in blocks:
+            for k in ("call_count", "total_time", "total_cputime"):
+                try:
+                    worst = max(worst, int(b.get(k, 0)))
+                except (TypeError, ValueError):
+                    pass
+    return worst
+
+
+async def delete_one(client, post_id, page_token, ctl, job) -> Dict[str, Any]:
+    """[LIMIT] satu DELETE + jeda otomatis saat kuota hampir habis / kena limit."""
+    for attempt in range(1, MAX_RL_RETRIES + 2):
+        if ctl["stop"]:
+            return {"post_id": post_id, "success": False, "error": ctl["stop_reason"]}
+        wait = ctl["pause_until"] - time.time()
+        if wait > 0:
+            job["note"] = f"Jeda {int(wait)} dtk karena batas Facebook..."
+            await asyncio.sleep(wait)
+            job["note"] = ""
+        try:
+            r = await client.delete(f"{BASE_URL}/{post_id}", params={"access_token": page_token})
+        except httpx.TimeoutException:
+            return {"post_id": post_id, "success": False,
+                    "error": "Timeout saat menunggu Meta API; periksa status postingan sebelum mencoba lagi."}
+        except httpx.HTTPError as e:
+            return {"post_id": post_id, "success": False, "error": f"Network error: {str(e)}"}
+        except Exception as e:
+            return {"post_id": post_id, "success": False, "error": str(e)}
+
+        try:
+            data = r.json()
+        except ValueError:
+            data = {"error": {"message": f"Respons Meta bukan JSON (HTTP {r.status_code})"}}
+
+        # pelan-pelan otomatis jika kuota mulai tinggi
+        pct = usage_pct(r.headers)
+        if pct >= 90:
+            ctl["pause_until"] = max(ctl["pause_until"], time.time() + 60)
+            ctl["extra_delay"] = 1.5
+        elif pct >= 70:
+            ctl["extra_delay"] = 0.8
+        elif pct < 40:
+            ctl["extra_delay"] = 0.0
+
+        success = r.is_success and bool(data.get("success"))
+        err = data.get("error") or {}
+        result = {"post_id": post_id, "success": success, "response": data,
+                  "error": err.get("message") if not success else None}
+        if success:
+            return result
+
+        code = err.get("code")
+        if code in BLOCK_CODES:
+            ctl["stop"] = True
+            ctl["stop_reason"] = "Dihentikan: akun dibatasi sementara oleh Facebook. Tunggu beberapa jam."
+            return result
+        if code in RATE_LIMIT_CODES or r.status_code == 429:
+            if attempt <= MAX_RL_RETRIES:
+                backoff = min(600, 60 * 2 ** (attempt - 1))  # 60, 120, 240 dtk
+                ctl["pause_until"] = max(ctl["pause_until"], time.time() + backoff)
+                ctl["extra_delay"] = max(ctl["extra_delay"], 1.0)
+                continue
+            ctl["stop"] = True
+            ctl["stop_reason"] = "Dihentikan: terkena limit Facebook berulang. Coba lagi 1 jam kemudian dengan paralel lebih kecil."
+        return result
+    return {"post_id": post_id, "success": False, "error": "Gagal setelah beberapa percobaan"}
+
+
 async def run_delete_job(job_id: str, req: DeleteRequest):
     job = DELETE_JOBS[job_id]
     sess = SESSIONS.get(req.session_id)
@@ -236,6 +331,7 @@ async def run_delete_job(job_id: str, req: DeleteRequest):
     delay_seconds = max(0, min(int(req.delay_ms or 0), 60000)) / 1000.0
     semaphore = asyncio.Semaphore(concurrency)
     job["concurrency"] = concurrency
+    ctl = {"pause_until": 0.0, "stop": False, "stop_reason": "", "extra_delay": 0.0}  # [LIMIT]
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         async def process_one(post_id: str) -> Dict[str, Any]:
@@ -249,25 +345,10 @@ async def run_delete_job(job_id: str, req: DeleteRequest):
                           "message": "Simulasi berhasil (tidak dihapus)"}
             else:
                 async with semaphore:
-                    try:
-                        r = await client.delete(f"{BASE_URL}/{post_id}",
-                                                params={"access_token": page_token})
-                        try:
-                            data = r.json()
-                        except ValueError:
-                            data = {"error": {"message": f"Respons Meta bukan JSON (HTTP {r.status_code})"}}
-                        success = r.is_success and bool(data.get("success"))
-                        result = {"post_id": post_id, "success": success, "response": data,
-                                  "error": data.get("error", {}).get("message") if not success else None}
-                    except httpx.TimeoutException:
-                        result = {"post_id": post_id, "success": False,
-                                  "error": "Timeout saat menunggu Meta API; periksa status postingan sebelum mencoba lagi."}
-                    except httpx.HTTPError as e:
-                        result = {"post_id": post_id, "success": False, "error": f"Network error: {str(e)}"}
-                    except Exception as e:
-                        result = {"post_id": post_id, "success": False, "error": str(e)}
-                    if delay_seconds:
-                        await asyncio.sleep(delay_seconds)
+                    result = await delete_one(client, post_id, page_token, ctl, job)  # [LIMIT]
+                    pause = delay_seconds + ctl["extra_delay"]
+                    if pause:
+                        await asyncio.sleep(pause)
 
             job["results"].append(result)
             job["completed"] += 1
@@ -292,7 +373,7 @@ async def delete_posts(req: DeleteRequest):
         "job_id": job_id, "status": "running", "total": len(req.post_ids),
         "completed": 0, "success": 0, "failed": 0, "results": [],
         "concurrency": max(1, min(int(req.concurrency or 3), 5)),
-        "dry_run": req.dry_run, "created": time.time()
+        "dry_run": req.dry_run, "created": time.time(), "note": ""
     }
     asyncio.create_task(run_delete_job(job_id, req))
     return {"job_id": job_id, "total": len(req.post_ids), "status": "running"}
@@ -307,7 +388,8 @@ async def delete_progress(job_id: str):
         "job_id": job["job_id"], "status": job["status"], "total": job["total"],
         "completed": job["completed"], "success": job["success"], "failed": job["failed"],
         "concurrency": job["concurrency"], "dry_run": job["dry_run"],
-        "results": list(job["results"]) if job["status"] != "running" else [], "error": job.get("error")
+        "results": list(job["results"]) if job["status"] != "running" else [], "error": job.get("error"),
+        "note": job.get("note", "")
     }
 
 

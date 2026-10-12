@@ -46,8 +46,8 @@
           <h2 class="font-semibold">Postingan</h2>
           <div>
             <label class="text-sm mr-3"><input type="checkbox" id="dry-run" checked> Dry Run (simulasi)</label>
-            <label class="text-sm mr-2">Delay: <input type="number" id="delay" value="300" min="0" max="60000" class="w-16 border rounded px-1"> ms</label>
-            <label class="text-sm">Paralel: <input type="number" id="concurrency" value="3" min="1" max="5" class="w-12 border rounded px-1" title="Maksimal 5 permintaan bersamaan"></label>
+            <label class="text-sm mr-2">Delay: <input type="number" id="delay" value="500" min="0" max="60000" class="w-16 border rounded px-1"> ms</label>
+            <label class="text-sm">Paralel: <input type="number" id="concurrency" value="2" min="1" max="5" class="w-12 border rounded px-1" title="Maksimal 5 permintaan bersamaan"></label>
           </div>
         </div>
         <div id="posts" class="max-h-96 overflow-y-auto border rounded p-2 text-sm"></div>
@@ -295,7 +295,7 @@ async function deleteSelected() {
       const completed = data.completed || 0;
       const total = data.total || ids.length;
       const pct = total ? Math.round(completed / total * 100) : 100;
-      progressText.textContent = `Selesai ${completed} dari ${total} (${pct}%) | Berhasil ${data.success || 0} | Gagal ${data.failed || 0}`;
+      progressText.textContent = `Selesai ${completed} dari ${total} (${pct}%) | Berhasil ${data.success || 0} | Gagal ${data.failed || 0}` + (data.note ? ` | ${data.note}` : '');
       progressBar.style.width = `${pct}%`;
       if (data.status !== 'running') break;
     }
