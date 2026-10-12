@@ -46,8 +46,8 @@
           <h2 class="font-semibold">Postingan</h2>
           <div>
             <label class="text-sm mr-3"><input type="checkbox" id="dry-run" checked> Dry Run (simulasi)</label>
-            <label class="text-sm mr-2">Delay: <input type="number" id="delay" value="500" min="0" max="60000" class="w-16 border rounded px-1"> ms</label>
-            <label class="text-sm">Paralel: <input type="number" id="concurrency" value="2" min="1" max="5" class="w-12 border rounded px-1" title="Maksimal 5 permintaan bersamaan"></label>
+            <label class="text-sm mr-2">Delay: <input type="number" id="delay" value="300" min="0" max="60000" class="w-16 border rounded px-1"> ms</label>
+            <label class="text-sm">Paralel: <input type="number" id="concurrency" value="3" min="1" max="5" class="w-12 border rounded px-1" title="Maksimal 5 permintaan bersamaan"></label>
           </div>
         </div>
         <div id="posts" class="max-h-96 overflow-y-auto border rounded p-2 text-sm"></div>
@@ -84,6 +84,7 @@ function isProtected(postId) {
   if (parts.length >= 2) {
     const postPart = parts[parts.length - 1];
     if (protectedPostIds.has(postPart)) return true;
+    // Cek juga full ID yang mungkin beda prefix
     for (const p of protectedPostIds) {
       if (String(p).endsWith('_' + postPart) || String(p) === postPart) return true;
     }
@@ -100,8 +101,11 @@ async function checkAdsPosts() {
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || 'Error');
     protectedPostIds = new Set(data.protected_posts || []);
+    console.log('Protected posts loaded:', protectedPostIds.size);
+    console.log('Sample protected:', Array.from(protectedPostIds).slice(0, 10));
     status.textContent = `Ditemukan ${data.count} postingan dipakai ads (dari ${data.ad_accounts?.length || 0} ad account)`;
     if (data.warning) status.textContent += ' | Warning: ' + data.warning;
+    // Refresh tampilan jika posts sudah di-load
     if (document.getElementById('posts').children.length) {
       markProtectedPosts();
     }
@@ -139,7 +143,7 @@ async function login() {
     if (!res.ok) throw new Error(data.detail || 'Error');
     sessionId = data.session_id;
     pageTokens = {};
-    data.pages.forEach(p => pageTokens[p.id] = null);
+    data.pages.forEach(p => pageTokens[p.id] = null); // will fill later
     renderPages(data.pages);
     document.getElementById('login-box').classList.add('hidden');
     document.getElementById('main').classList.remove('hidden');
@@ -172,7 +176,6 @@ async function loadSelectedPages() {
   selectedPosts.clear();
 
   let allPosts = [];
-  let warnings = '';  // [REELS] peringatan jika Reels gagal diambil
   const seenIds = new Set();
   for (const cb of checks) {
     const pageId = cb.value;
@@ -184,9 +187,8 @@ async function loadSelectedPages() {
       postsEl.innerHTML += `<div class="text-red-600">Error page ${pageName}: ${data.detail}</div>`;
       continue;
     }
-    if (data.warning) warnings += `<div class="text-orange-600 text-xs p-1">${pageName}: ${data.warning}</div>`;
     data.posts.forEach(p => {
-      if (seenIds.has(p.id)) return;
+      if (seenIds.has(p.id)) return;  // skip duplikat
       seenIds.add(p.id);
       p._pageName = pageName;
       p._pageId = pageId;
@@ -194,10 +196,13 @@ async function loadSelectedPages() {
     });
   }
 
-  postsEl.innerHTML = warnings + (allPosts.map(p => {
+  console.log('Loaded unique posts:', allPosts.length);
+
+  postsEl.innerHTML = allPosts.map(p => {
     let thumb = '';
     let mediaLabel = '';
 
+    // Prioritas thumbnail
     if (p.full_picture) {
       thumb = p.full_picture;
     } else if (p.attachments && p.attachments.data && p.attachments.data[0]) {
@@ -211,17 +216,15 @@ async function loadSelectedPages() {
     const text = (p.message || '').trim() || '(tidak ada caption)';
     const shortText = text.length > 140 ? text.slice(0, 140) + '…' : text;
     const protectedFlag = isProtected(p.id);
-    const reelBadge = p.type === 'reel'
-      ? ' <span class="ml-1 px-1.5 py-0.5 bg-purple-600 text-white text-[10px] rounded">REEL</span>' : '';  // [REELS]
 
     return `
       <label class="flex gap-3 py-2 border-b hover:bg-gray-50 text-xs items-start ${protectedFlag ? 'bg-yellow-50 border-l-4 border-orange-400' : ''}">
         <input type="checkbox" class="post-check mt-1" value="${p.id}" data-page="${p._pageId}" ${protectedFlag ? 'disabled' : ''}>
         ${thumb ? `<img src="${thumb}" class="w-16 h-16 object-cover rounded flex-shrink-0 bg-gray-200" loading="lazy" onerror="this.style.display='none'">` : '<div class="w-16 h-16 bg-gray-200 rounded flex-shrink-0 flex items-center justify-center text-gray-400 text-[10px]">no img</div>'}
         <div class="flex-1 min-w-0">
-          <div class="font-medium break-words">${shortText}${reelBadge}${protectedFlag ? ' <span class="ads-badge ml-1 px-1.5 py-0.5 bg-orange-500 text-white text-[10px] rounded">ADS</span>' : ''}</div>
+          <div class="font-medium break-words">${shortText}${protectedFlag ? ' <span class="ads-badge ml-1 px-1.5 py-0.5 bg-orange-500 text-white text-[10px] rounded">ADS</span>' : ''}</div>
           <div class="text-gray-500 mt-1">
-            ${p.created_time?.slice(0,16).replace('T',' ') || ''} · ${p._pageName}
+            ${p.created_time?.slice(0,16).replace('T',' ')} · ${p._pageName}
             ${mediaLabel ? ` · <span class="text-blue-600">${mediaLabel}</span>` : ''}
             · <a href="${p.permalink_url}" target="_blank" class="text-blue-600 hover:underline">buka</a>
             <span class="text-gray-400 ml-1">(${p.id})</span>
@@ -229,7 +232,7 @@ async function loadSelectedPages() {
         </div>
       </label>
     `;
-  }).join('') || '<div class="text-gray-500">Tidak ada postingan</div>');
+  }).join('') || '<div class="text-gray-500">Tidak ada postingan</div>';
 }
 
 function selectAll() {
@@ -254,9 +257,6 @@ async function deleteSelected() {
   const checked = Array.from(document.querySelectorAll('.post-check:checked')).filter(cb => !cb.disabled);
   const ids = checked.map(cb => cb.value);
   if (!ids.length) return alert('Pilih postingan dulu (postingan ADS tidak bisa dipilih)');
-  // [REELS] kirim pemetaan post_id -> page_id (ID Reel tidak berprefix page)
-  const postPages = {};
-  checked.forEach(cb => { postPages[cb.value] = cb.dataset.page; });
   const dry = document.getElementById('dry-run').checked;
   const delayInput = parseInt(document.getElementById('delay').value);
   const delay = Number.isFinite(delayInput) ? Math.max(0, Math.min(delayInput, 60000)) : 300;
@@ -278,7 +278,7 @@ async function deleteSelected() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        session_id: sessionId, post_ids: ids, post_pages: postPages, page_tokens: {},
+        session_id: sessionId, post_ids: ids, page_tokens: {},
         dry_run: dry, delay_ms: delay, concurrency: concurrency
       })
     });
@@ -295,7 +295,7 @@ async function deleteSelected() {
       const completed = data.completed || 0;
       const total = data.total || ids.length;
       const pct = total ? Math.round(completed / total * 100) : 100;
-      progressText.textContent = `Selesai ${completed} dari ${total} (${pct}%) | Berhasil ${data.success || 0} | Gagal ${data.failed || 0}` + (data.note ? ` | ${data.note}` : '');
+      progressText.textContent = `Selesai ${completed} dari ${total} (${pct}%) | Berhasil ${data.success || 0} | Gagal ${data.failed || 0}`;
       progressBar.style.width = `${pct}%`;
       if (data.status !== 'running') break;
     }
