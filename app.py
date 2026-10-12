@@ -1,10 +1,13 @@
 import asyncio
+import os
+import secrets
 import time
-from typing import List, Dict, Any, Optional
 from datetime import datetime
+from typing import Any, Dict, List, Optional, Set
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import httpx
-from fastapi import FastAPI, Request, Form, HTTPException
+from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -15,19 +18,312 @@ templates = Jinja2Templates(directory="templates")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 SESSIONS: Dict[str, Dict] = {}
-GRAPH_VERSION = "v26.0"
+LOAD_JOBS: Dict[str, Dict[str, Any]] = {}
+DELETE_JOBS: Dict[str, Dict[str, Any]] = {}
+
+GRAPH_VERSION = os.environ.get("GRAPH_VERSION", "v26.0")
 BASE_URL = f"https://graph.facebook.com/{GRAPH_VERSION}"
+FB_WEB = "https://www.facebook.com"
+
+POST_FIELDS = (
+    "id,message,created_time,permalink_url,status_type,full_picture,"
+    "attachments{media_type,type,target{id},subattachments{target{id},media_type}}"
+)
+TRANSIENT_CODES = {2, 4, 17, 32, 341, 613, 80001, 80004}
+WINDOW_SECONDS = 90 * 86400
+SPLIT_THRESHOLD = 400          # jika 1 jendela >= ini, dipecah dua
+MAX_EMPTY_WINDOWS = 16         # 16 x 90 hari ≈ 4 tahun kosong berturut-turut -> berhenti
+MIN_TS = 1075593600            # 2004-02-01
+
+
+class FBError(Exception):
+    def __init__(self, message: str, code: Optional[int] = None):
+        super().__init__(message)
+        self.message = message
+        self.code = code
 
 
 class DeleteRequest(BaseModel):
     session_id: str
     post_ids: List[str]
-    page_tokens: Dict[str, str]
+    post_pages: Dict[str, str] = {}
+    page_tokens: Dict[str, str] = {}
     dry_run: bool = True
-    delay_ms: int = 800
+    delay_ms: int = 300
     concurrency: int = 3
 
 
+class LoadRequest(BaseModel):
+    session_id: str
+    page_ids: List[str]
+
+
+# ------------------------------------------------------------------ helpers
+async def fb_get(client: httpx.AsyncClient, url: str, params: Optional[dict] = None) -> dict:
+    last_msg = "Unknown error"
+    last_code = None
+    for attempt in range(6):
+        try:
+            r = await client.get(url, params=params)
+            data = r.json()
+        except Exception as exc:
+            last_msg = str(exc) or exc.__class__.__name__
+            await asyncio.sleep(1.5 * (attempt + 1))
+            continue
+        if isinstance(data, dict) and "error" in data:
+            err = data["error"] or {}
+            last_msg = err.get("message", "API error")
+            last_code = err.get("code")
+            if last_code in TRANSIENT_CODES or err.get("is_transient"):
+                await asyncio.sleep(min(60, 3 * (attempt + 1) ** 2))
+                continue
+            raise FBError(last_msg, last_code)
+        if not isinstance(data, dict):
+            raise FBError("Response bukan JSON object")
+        return data
+    raise FBError(last_msg, last_code)
+
+
+def set_limit(url: str, limit: int) -> str:
+    p = urlparse(url)
+    q = dict(parse_qsl(p.query))
+    q["limit"] = str(limit)
+    return urlunparse(p._replace(query=urlencode(q)))
+
+
+async def fetch_all(client: httpx.AsyncClient, url: str, params: dict, page_size: int = 100) -> List[dict]:
+    """Ambil semua halaman dari satu edge sampai habis."""
+    items: List[dict] = []
+    cur_url: Optional[str] = url
+    cur_params: Optional[dict] = dict(params, limit=page_size)
+    seen_urls: Set[str] = set()
+    reduced = False
+
+    while cur_url:
+        if cur_params is None:
+            if cur_url in seen_urls:
+                break
+            seen_urls.add(cur_url)
+        try:
+            data = await fb_get(client, cur_url, cur_params)
+        except FBError as e:
+            if (e.code == 1 or "reduce the amount" in e.message.lower()) and page_size > 5:
+                page_size = max(5, page_size // 2)
+                reduced = True
+                if cur_params is not None:
+                    cur_params["limit"] = page_size
+                else:
+                    cur_url = set_limit(cur_url, page_size)
+                continue
+            raise
+        items.extend(x for x in data.get("data", []) if isinstance(x, dict))
+        nxt = (data.get("paging") or {}).get("next")
+        if nxt and reduced:
+            nxt = set_limit(nxt, page_size)
+        cur_url, cur_params = nxt, None
+    return items
+
+
+async def fetch_window(client, url, token, since: int, until: int) -> List[dict]:
+    items = await fetch_all(client, url, {
+        "fields": POST_FIELDS, "access_token": token, "since": since, "until": until,
+    })
+    if len(items) >= SPLIT_THRESHOLD and (until - since) > 3600:
+        mid = (since + until) // 2
+        a = await fetch_window(client, url, token, since, mid)
+        b = await fetch_window(client, url, token, mid, until)
+        return a + b
+    return items
+
+
+async def get_story_ids(client: httpx.AsyncClient, page_id: str, token: str) -> Set[str]:
+    ids: Set[str] = set()
+    for fields in ("post_id,media_id", "post_id"):
+        try:
+            items = await fetch_all(client, f"{BASE_URL}/{page_id}/stories",
+                                    {"fields": fields, "access_token": token})
+        except FBError:
+            continue
+        for it in items:
+            for k in ("post_id", "media_id", "id"):
+                v = it.get(k)
+                if v:
+                    ids.add(str(v))
+                    ids.add(str(v).split("_")[-1])
+        break
+    return ids
+
+
+def collect_targets(p: dict) -> Set[str]:
+    out: Set[str] = set()
+    for a in (p.get("attachments") or {}).get("data", []) or []:
+        t = (a.get("target") or {}).get("id")
+        if t:
+            out.add(str(t))
+        for s in (a.get("subattachments") or {}).get("data", []) or []:
+            t2 = (s.get("target") or {}).get("id")
+            if t2:
+                out.add(str(t2))
+    return out
+
+
+def abs_url(u: Optional[str]) -> Optional[str]:
+    if not u:
+        return None
+    return u if u.startswith("http") else FB_WEB + u
+
+
+async def load_page_posts(client, page: dict, job: dict) -> List[dict]:
+    page_id, name, token = str(page["id"]), page.get("name", ""), page["access_token"]
+
+    def log(msg: str):
+        job["log"].append(f"[{name}] {msg}")
+
+    story_ids = await get_story_ids(client, page_id, token)
+    log(f"Story aktif dikecualikan: {len(story_ids) // 2 if story_ids else 0}")
+
+    collected: Dict[str, dict] = {}
+    targets: Set[str] = set()
+    skipped_story = 0
+
+    def add_posts(raw: List[dict]):
+        nonlocal skipped_story
+        for p in raw:
+            pid = p.get("id")
+            if not pid:
+                continue
+            pid = str(pid)
+            part = pid.split("_")[-1]
+            tg = collect_targets(p)
+            if pid in story_ids or part in story_ids or (tg & story_ids):
+                skipped_story += 1
+                continue
+            targets.update(tg)
+            p["type"] = "post"
+            p["permalink_url"] = abs_url(p.get("permalink_url"))
+            collected.setdefault(pid, p)
+
+    url = f"{BASE_URL}/{page_id}/published_posts"
+
+    # Pass A: pagination biasa
+    try:
+        raw = await fetch_all(client, url, {"fields": POST_FIELDS, "access_token": token})
+        add_posts(raw)
+        log(f"Pass A (paging biasa): {len(collected)} postingan")
+    except FBError as e:
+        job["warnings"].append(f"{name}: pass A gagal - {e.message}")
+        log(f"Pass A gagal: {e.message}")
+
+    # Pass B: jendela waktu (menembus batas kedalaman paging Facebook)
+    until = int(time.time()) + 86400
+    empty = 0
+    n_win = 0
+    try:
+        while until > MIN_TS and empty < MAX_EMPTY_WINDOWS:
+            since = until - WINDOW_SECONDS
+            raw = await fetch_window(client, url, token, since, until)
+            before = len(collected)
+            add_posts(raw)
+            empty = empty + 1 if not raw else 0
+            n_win += 1
+            if len(collected) > before:
+                d = datetime.fromtimestamp(since).strftime("%Y-%m-%d")
+                log(f"Jendela {d}: +{len(collected) - before} (total {len(collected)})")
+            until = since
+        log(f"Pass B (jendela waktu, {n_win} jendela): total {len(collected)} postingan")
+    except FBError as e:
+        job["warnings"].append(f"{name}: pass B gagal - {e.message}")
+        log(f"Pass B gagal: {e.message}")
+
+    known = {k.split("_")[-1] for k in collected} | targets
+
+    # Video
+    added_v = 0
+    try:
+        vids = await fetch_all(client, f"{BASE_URL}/{page_id}/videos", {
+            "fields": "id,description,created_time,permalink_url,picture",
+            "access_token": token,
+        })
+        for v in vids:
+            vid = str(v.get("id", ""))
+            if not vid or vid in known or vid in story_ids:
+                continue
+            known.add(vid)
+            collected[vid] = {
+                "id": vid, "message": v.get("description") or "(Video)",
+                "created_time": v.get("created_time"),
+                "permalink_url": abs_url(v.get("permalink_url")) or f"{FB_WEB}/watch/?v={vid}",
+                "full_picture": v.get("picture"), "type": "video",
+            }
+            added_v += 1
+    except FBError as e:
+        job["warnings"].append(f"{name}: videos - {e.message}")
+    log(f"Video tambahan (belum ada di feed): {added_v}")
+
+    # Reels
+    added_r = 0
+    try:
+        reels = await fetch_all(client, f"{BASE_URL}/{page_id}/video_reels", {
+            "fields": "id,description,updated_time",
+            "access_token": token,
+        })
+        for rl in reels:
+            rid = str(rl.get("id", ""))
+            if not rid or rid in known or rid in story_ids:
+                continue
+            known.add(rid)
+            collected[rid] = {
+                "id": rid, "message": rl.get("description") or "(Reel)",
+                "created_time": rl.get("updated_time"),
+                "permalink_url": f"{FB_WEB}/reel/{rid}",
+                "full_picture": None, "type": "reel",
+            }
+            added_r += 1
+    except FBError as e:
+        job["warnings"].append(f"{name}: reels - {e.message}")
+    log(f"Reels tambahan: {added_r}")
+
+    if skipped_story:
+        log(f"Item story terlewati: {skipped_story}")
+
+    result = list(collected.values())
+    result.sort(key=lambda x: x.get("created_time") or "", reverse=True)
+    for p in result:
+        p["_pageId"] = page_id
+        p["_pageName"] = name
+    return result
+
+
+async def run_load_job(job_id: str, req: LoadRequest):
+    job = LOAD_JOBS[job_id]
+    sess = SESSIONS.get(req.session_id)
+    if not sess:
+        job.update(status="error", error="Session expired")
+        return
+    pages = {str(p["id"]): p for p in sess["pages"]}
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            for pid in req.page_ids:
+                page = pages.get(str(pid))
+                if not page or not page.get("access_token"):
+                    job["log"].append(f"[{pid}] Page token tidak ditemukan")
+                    job["pages_done"] += 1
+                    continue
+                job["current"] = page.get("name", pid)
+                try:
+                    posts = await load_page_posts(client, page, job)
+                    job["posts"].extend(posts)
+                    job["log"].append(f"[{page.get('name')}] SELESAI: {len(posts)} item")
+                except Exception as exc:
+                    job["log"].append(f"[{page.get('name')}] GAGAL: {exc}")
+                job["pages_done"] += 1
+                job["count"] = len(job["posts"])
+        job["status"] = "completed"
+    except Exception as exc:
+        job.update(status="error", error=str(exc))
+
+
+# ------------------------------------------------------------------ routes
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
@@ -37,233 +333,110 @@ async def index(request: Request):
 async def login(token: str = Form(...)):
     if not token or len(token) < 50:
         raise HTTPException(status_code=400, detail="Token tidak valid")
-
-    pages = []
-    url = f"{BASE_URL}/me/accounts"
-    params = {
-        "fields": "id,name,access_token,category,tasks",
-        "access_token": token,
-        "limit": 100,
-    }
-    visited_urls = set()
-
+    pages: List[dict] = []
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            while url:
-                if url in visited_urls:
-                    raise HTTPException(status_code=502, detail="Pagination daftar Page berulang.")
-                visited_urls.add(url)
-                response = await client.get(url, params=params)
-                params = None
-                data = response.json()
-                if "error" in data:
-                    raise HTTPException(status_code=400, detail=data["error"].get("message", "Token error"))
-                pages.extend(data.get("data", []))
-                url = (data.get("paging") or {}).get("next")
-    except HTTPException:
-        raise
+            items = await fetch_all(client, f"{BASE_URL}/me/accounts", {
+                "fields": "id,name,access_token,category,tasks", "access_token": token,
+            })
+            pages.extend(items)
+    except FBError as e:
+        raise HTTPException(status_code=400, detail=e.message)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc))
 
-    session_id = f"sess_{int(time.time() * 1000)}"
+    session_id = "sess_" + secrets.token_urlsafe(16)
     SESSIONS[session_id] = {"user_token": token, "pages": pages, "created": datetime.now().isoformat()}
     return {
         "session_id": session_id,
-        "pages": [{"id": p["id"], "name": p["name"], "category": p.get("category", ""), "has_token": bool(p.get("access_token"))} for p in pages],
+        "pages": [{"id": p["id"], "name": p["name"], "category": p.get("category", ""),
+                   "has_token": bool(p.get("access_token"))} for p in pages],
     }
 
 
-async def get_stories_post_ids(page_id: str, page_token: str) -> set:
-    story_ids = set()
-    url = f"{BASE_URL}/{page_id}/stories"
-    params = {"fields": "post_id", "limit": 100, "access_token": page_token}
-    visited = set()
-    first = True
-
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        while url and url not in visited:
-            visited.add(url)
-            try:
-                r = await client.get(url, params=params if first else None)
-                first = False
-                data = r.json()
-                if not isinstance(data, dict) or "error" in data:
-                    break
-                for item in data.get("data", []):
-                    pid = item.get("post_id")
-                    if pid:
-                        story_ids.add(str(pid))
-                url = (data.get("paging") or {}).get("next")
-                params = None
-            except Exception:
-                break
-    return story_ids
-
-
-@app.get("/api/posts/{session_id}/{page_id}")
-async def get_posts(session_id: str, page_id: str, limit: int = 50, since: Optional[str] = None, until: Optional[str] = None):
-    if limit < 1 or limit > 10000:
-        raise HTTPException(status_code=400, detail="Limit harus 1-10000")
-    sess = SESSIONS.get(session_id)
-    if not sess:
+@app.post("/api/load/start")
+async def load_start(req: LoadRequest):
+    if req.session_id not in SESSIONS:
         raise HTTPException(status_code=404, detail="Session expired")
-    page = next((p for p in sess["pages"] if str(p.get("id")) == str(page_id)), None)
-    if not page or not page.get("access_token"):
-        raise HTTPException(status_code=400, detail="Page token tidak ditemukan")
+    if not req.page_ids:
+        raise HTTPException(status_code=400, detail="Pilih minimal 1 Page")
+    job_id = "load_" + secrets.token_urlsafe(8)
+    LOAD_JOBS[job_id] = {
+        "job_id": job_id, "status": "running", "total_pages": len(req.page_ids),
+        "pages_done": 0, "current": "", "count": 0, "posts": [], "log": [],
+        "warnings": [], "error": None,
+    }
+    asyncio.create_task(run_load_job(job_id, req))
+    return {"job_id": job_id}
 
-    page_token = page["access_token"]
-    story_ids = await get_stories_post_ids(page_id, page_token)
 
-    fields = "id,message,created_time,permalink_url,status_type,full_picture,attachments{media_type,media,type,title,description,url,subattachments}"
-    posts, seen, visited = [], set(), set()
-    warning = None
-
-    # 1. Postingan biasa
-    url = f"{BASE_URL}/{page_id}/posts"
-    params = {"fields": fields, "limit": 100, "access_token": page_token}
-    if since:
-        params["since"] = since
-    if until:
-        params["until"] = until
-    first = True
-
-    async with httpx.AsyncClient(timeout=45.0) as client:
-        while url and len(posts) < limit:
-            if url in visited:
-                warning = "Pagination berulang"
-                break
-            visited.add(url)
-            try:
-                r = await client.get(url, params=params if first else None)
-            except Exception as e:
-                warning = str(e)
-                break
-            first = False
-            try:
-                data = r.json()
-            except Exception:
-                warning = "Bukan JSON"
-                break
-            if not isinstance(data, dict) or "error" in data:
-                warning = (data.get("error") or {}).get("message", "API error")
-                break
-            for p in data.get("data", []):
-                if not isinstance(p, dict) or not p.get("id"):
-                    continue
-                post_id = str(p["id"])
-                post_part = post_id.split("_")[-1] if "_" in post_id else post_id
-                if post_id in story_ids or post_part in story_ids:
-                    continue
-                if post_id not in seen:
-                    seen.add(post_id)
-                    p["type"] = "post"  # tandai sebagai post biasa
-                    posts.append(p)
-                    if len(posts) >= limit:
-                        break
-            url = (data.get("paging") or {}).get("next")
-            params = None
-
-        # 2. Reels — ditandai jelas
-        if len(posts) < limit:
-            reels_url = f"{BASE_URL}/{page_id}/video_reels"
-            reels_params = {
-                "fields": "id,description,updated_time",
-                "limit": 50,
-                "access_token": page_token,
-            }
-            try:
-                r = await client.get(reels_url, params=reels_params)
-                data = r.json()
-                if isinstance(data, dict) and "error" not in data:
-                    for item in data.get("data", []):
-                        if not isinstance(item, dict) or not item.get("id"):
-                            continue
-                        vid = str(item["id"])
-                        if vid in seen:
-                            continue
-                        seen.add(vid)
-                        posts.append({
-                            "id": vid,
-                            "message": item.get("description") or "(Reel)",
-                            "created_time": item.get("updated_time"),
-                            "permalink_url": None,
-                            "full_picture": None,
-                            "status_type": "reel",
-                            "type": "reel",          # ← penanda Reels
-                        })
-                        if len(posts) >= limit:
-                            break
-                elif isinstance(data, dict) and "error" in data:
-                    warning = (warning or "") + " | Reels: " + data["error"].get("message", "error")
-            except Exception as e:
-                warning = (warning or "") + f" | Reels error: {e}"
-
+@app.get("/api/load/progress/{job_id}")
+async def load_progress(job_id: str):
+    job = LOAD_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Load job not found")
+    done = job["status"] != "running"
     return {
-        "page_id": page_id,
-        "posts": posts,
-        "count": len(posts),
-        "requested_limit": limit,
-        "limit_reached": len(posts) >= limit,
-        "warning": warning,
+        "status": job["status"], "total_pages": job["total_pages"],
+        "pages_done": job["pages_done"], "current": job["current"],
+        "count": job["count"], "log": job["log"][-40:],
+        "warnings": job["warnings"], "error": job["error"],
+        "posts": job["posts"] if done else [],
     }
 
-# ===================== DELETE (tidak diubah) =====================
-DELETE_JOBS: Dict[str, Dict[str, Any]] = {}
 
 async def run_delete_job(job_id: str, req: DeleteRequest):
     job = DELETE_JOBS[job_id]
     sess = SESSIONS.get(req.session_id)
     if not sess:
-        job.update({"status": "error", "error": "Session expired"})
+        job.update(status="error", error="Session expired")
         return
 
-    page_token_by_id = {str(p["id"]): p.get("access_token") for p in sess["pages"]}
+    token_by_page = {str(p["id"]): p.get("access_token") for p in sess["pages"]}
     concurrency = max(1, min(int(req.concurrency or 3), 5))
-    delay_seconds = max(0, min(int(req.delay_ms or 0), 60000)) / 1000.0
-    semaphore = asyncio.Semaphore(concurrency)
+    delay = max(0, min(int(req.delay_ms or 0), 60000)) / 1000.0
+    sem = asyncio.Semaphore(concurrency)
     job["concurrency"] = concurrency
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         async def process_one(post_id: str):
-            page_id = post_id.split("_")[0] if "_" in post_id else None
-            page_token = page_token_by_id.get(str(page_id)) or req.page_tokens.get(post_id)
-            if not page_token:
+            page_id = req.post_pages.get(post_id) or (post_id.split("_")[0] if "_" in post_id else None)
+            token = token_by_page.get(str(page_id)) or req.page_tokens.get(post_id)
+            if not token:
                 result = {"post_id": post_id, "success": False, "error": "Page token tidak ditemukan"}
             elif req.dry_run:
                 result = {"post_id": post_id, "success": True, "dry_run": True, "message": "Simulasi"}
             else:
-                async with semaphore:
+                async with sem:
                     try:
-                        response = await client.delete(f"{BASE_URL}/{post_id}", params={"access_token": page_token})
+                        resp = await client.delete(f"{BASE_URL}/{post_id}", params={"access_token": token})
                         try:
-                            data = response.json()
+                            data = resp.json()
                         except ValueError:
-                            data = {"error": {"message": f"HTTP {response.status_code}"}}
-                        success = response.is_success and isinstance(data, dict) and bool(data.get("success"))
-                        result = {"post_id": post_id, "success": success, "error": (data.get("error") or {}).get("message") if not success else None}
+                            data = {"error": {"message": f"HTTP {resp.status_code}"}}
+                        ok = resp.is_success and isinstance(data, dict) and bool(data.get("success"))
+                        result = {"post_id": post_id, "success": ok,
+                                  "error": None if ok else (data.get("error") or {}).get("message", "Gagal")}
                     except Exception as exc:
                         result = {"post_id": post_id, "success": False, "error": str(exc)}
-                    if delay_seconds:
-                        await asyncio.sleep(delay_seconds)
+                    if delay:
+                        await asyncio.sleep(delay)
             job["results"].append(result)
             job["completed"] += 1
-            if result.get("success"):
-                job["success"] += 1
-            else:
-                job["failed"] += 1
+            job["success" if result.get("success") else "failed"] += 1
 
         try:
             await asyncio.gather(*(process_one(pid) for pid in req.post_ids))
             job["status"] = "completed"
         except Exception as exc:
-            job.update({"status": "error", "error": str(exc)})
+            job.update(status="error", error=str(exc))
 
 
 @app.post("/api/delete")
 async def delete_posts(req: DeleteRequest):
     if req.session_id not in SESSIONS:
         raise HTTPException(status_code=404, detail="Session expired")
-    job_id = f"del_{int(time.time() * 1000)}_{len(DELETE_JOBS)}"
+    job_id = "del_" + secrets.token_urlsafe(8)
     DELETE_JOBS[job_id] = {
         "job_id": job_id, "status": "running", "total": len(req.post_ids),
         "completed": 0, "success": 0, "failed": 0, "results": [],
@@ -288,53 +461,6 @@ async def delete_progress(job_id: str):
     }
 
 
-@app.get("/api/ads-posts/{session_id}")
-async def get_ads_protected_posts(session_id: str):
-    sess = SESSIONS.get(session_id)
-    if not sess:
-        raise HTTPException(status_code=404, detail="Session expired")
-    token = sess["user_token"]
-    protected = set()
-    ad_accounts = []
-    async with httpx.AsyncClient(timeout=40.0) as client:
-        try:
-            r = await client.get(f"{BASE_URL}/me/adaccounts", params={"fields": "id,name", "access_token": token, "limit": 50})
-            data = r.json()
-            if "error" in data:
-                return {"protected_posts": [], "warning": data["error"].get("message"), "ad_accounts": []}
-            ad_accounts = data.get("data", [])
-        except Exception as e:
-            return {"protected_posts": [], "warning": str(e), "ad_accounts": []}
-
-        for acc in ad_accounts:
-            try:
-                url = f"{BASE_URL}/{acc['id']}/ads"
-                params = {
-                    "fields": "id,creative{object_story_id,effective_object_story_id}",
-                    "filtering": '[{"field":"effective_status","operator":"IN","value":["ACTIVE","PAUSED"]}]',
-                    "limit": 200, "access_token": token,
-                }
-                visited = set()
-                while url:
-                    if url in visited: break
-                    visited.add(url)
-                    r = await client.get(url, params=params)
-                    params = None
-                    data = r.json()
-                    if "error" in data: break
-                    for ad in data.get("data", []):
-                        creative = ad.get("creative") or {}
-                        for key in ("object_story_id", "effective_object_story_id"):
-                            sid = creative.get(key)
-                            if sid and "_" in str(sid):
-                                protected.add(str(sid))
-                                protected.add(str(sid).split("_", 1)[-1])
-                    url = (data.get("paging") or {}).get("next")
-            except Exception:
-                continue
-    return {"protected_posts": list(protected), "count": len(protected), "ad_accounts": [{"id": a["id"], "name": a.get("name","")} for a in ad_accounts]}
-
-
 @app.post("/api/logout")
 async def logout(session_id: str = Form(...)):
     SESSIONS.pop(session_id, None)
@@ -342,6 +468,5 @@ async def logout(session_id: str = Form(...)):
 
 
 if __name__ == "__main__":
-    import os, uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
