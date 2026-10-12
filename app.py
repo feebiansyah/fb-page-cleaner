@@ -394,6 +394,9 @@ async def load_progress(job_id: str):
     }
 
 
+LIMIT_CODES = {4, 17, 32, 613, 80001, 80004}
+
+
 async def run_delete_job(job_id: str, req: DeleteRequest):
     job = DELETE_JOBS[job_id]
     sess = SESSIONS.get(req.session_id)
@@ -406,16 +409,36 @@ async def run_delete_job(job_id: str, req: DeleteRequest):
     delay = max(0, min(int(req.delay_ms or 0), 60000)) / 1000.0
     sem = asyncio.Semaphore(concurrency)
     job["concurrency"] = concurrency
+    state = {"cooldown_until": 0.0, "hits": 0, "abort": False}
+
+    def record(result: dict):
+        job["results"].append(result)
+        job["completed"] += 1
+        job["success" if result.get("success") else "failed"] += 1
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         async def process_one(post_id: str):
+            if state["abort"]:
+                return
             page_id = req.post_pages.get(post_id) or (post_id.split("_")[0] if "_" in post_id else None)
             token = token_by_page.get(str(page_id)) or req.page_tokens.get(post_id)
             if not token:
-                result = {"post_id": post_id, "success": False, "error": "Page token tidak ditemukan"}
-            elif req.dry_run:
-                result = {"post_id": post_id, "success": True, "dry_run": True, "message": "Simulasi"}
-            else:
+                record({"post_id": post_id, "success": False, "error": "Page token tidak ditemukan"})
+                return
+            if req.dry_run:
+                record({"post_id": post_id, "success": True, "dry_run": True, "message": "Simulasi"})
+                return
+
+            result = None
+            for _ in range(8):
+                if state["abort"]:
+                    return
+                wait = state["cooldown_until"] - time.time()
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                    if state["abort"]:
+                        return
+
                 async with sem:
                     try:
                         resp = await client.delete(f"{BASE_URL}/{post_id}", params={"access_token": token})
@@ -423,23 +446,40 @@ async def run_delete_job(job_id: str, req: DeleteRequest):
                             data = resp.json()
                         except ValueError:
                             data = {"error": {"message": f"HTTP {resp.status_code}"}}
-                        ok = resp.is_success and isinstance(data, dict) and bool(data.get("success"))
-                        result = {"post_id": post_id, "success": ok,
-                                  "error": None if ok else (data.get("error") or {}).get("message", "Gagal")}
                     except Exception as exc:
                         result = {"post_id": post_id, "success": False, "error": str(exc)}
+                        break
                     if delay:
                         await asyncio.sleep(delay)
-            job["results"].append(result)
-            job["completed"] += 1
-            job["success" if result.get("success") else "failed"] += 1
+
+                err = (data.get("error") or {}) if isinstance(data, dict) else {}
+                if err.get("code") in LIMIT_CODES:
+                    # hanya hitung sekali per gelombang limit
+                    if time.time() >= state["cooldown_until"]:
+                        state["hits"] += 1
+                        if state["hits"] >= 4:
+                            state["abort"] = True
+                            job["error"] = ("Limit aplikasi Facebook tercapai. Proses dihentikan. "
+                                            "Tunggu 30-60 menit lalu coba lagi dengan Paralel 1 dan Delay 1000 ms.")
+                            return
+                        state["cooldown_until"] = time.time() + 120 * state["hits"]
+                    continue  # coba lagi item yang sama setelah jeda
+
+                state["hits"] = 0
+                ok = resp.is_success and isinstance(data, dict) and bool(data.get("success"))
+                result = {"post_id": post_id, "success": ok,
+                          "error": None if ok else err.get("message", "Gagal")}
+                break
+
+            if result is None:
+                result = {"post_id": post_id, "success": False, "error": "Gagal setelah beberapa percobaan"}
+            record(result)
 
         try:
             await asyncio.gather(*(process_one(pid) for pid in req.post_ids))
-            job["status"] = "completed"
+            job["status"] = "stopped" if state["abort"] else "completed"
         except Exception as exc:
             job.update(status="error", error=str(exc))
-
 
 @app.post("/api/delete")
 async def delete_posts(req: DeleteRequest):
