@@ -128,7 +128,7 @@ async def get_posts(session_id: str, page_id: str, limit: int = 50, since: Optio
 
 @app.get("/api/videos/{session_id}/{page_id}")
 async def get_videos(session_id: str, page_id: str, limit: int = 50):
-    """Load videos / reels dari page."""
+    """Load video posts biasa (bukan story)."""
     if limit < 1 or limit > 10000:
         raise HTTPException(status_code=400, detail="Limit harus 1-10000")
     sess = SESSIONS.get(session_id)
@@ -143,54 +143,54 @@ async def get_videos(session_id: str, page_id: str, limit: int = 50):
     seen = set()
     warning = None
 
-    # Coba beberapa endpoint video
-    endpoints = ["videos", "video_reels"]
+    # Hanya pakai /videos (bukan stories)
+    url = f"{BASE_URL}/{page_id}/videos"
+    params = {
+        "fields": "id,title,description,created_time,permalink_url,picture,source",
+        "limit": 100,
+        "access_token": page_token,
+    }
+    visited = set()
+    first = True
+
     async with httpx.AsyncClient(timeout=45.0) as client:
-        for endpoint in endpoints:
-            url = f"{BASE_URL}/{page_id}/{endpoint}"
-            params = {
-                "fields": "id,title,description,created_time,permalink_url,picture,source,length",
-                "limit": 100,
-                "access_token": page_token,
-            }
-            visited = set()
-            first = True
-            while url and len(videos) < limit:
-                if url in visited:
-                    break
-                visited.add(url)
-                try:
-                    r = await client.get(url, params=params if first else None)
-                except Exception as e:
-                    warning = str(e)
-                    break
-                first = False
-                try:
-                    data = r.json()
-                except Exception:
-                    warning = "Bukan JSON"
-                    break
-                if not isinstance(data, dict) or "error" in data:
-                    # Endpoint mungkin tidak tersedia, lanjut ke berikutnya
-                    break
-                for v in data.get("data", []):
-                    if isinstance(v, dict) and v.get("id") and v["id"] not in seen:
-                        seen.add(v["id"])
-                        # Normalisasi supaya mirip post
-                        videos.append({
-                            "id": v["id"],
-                            "message": v.get("title") or v.get("description") or "(video)",
-                            "created_time": v.get("created_time"),
-                            "permalink_url": v.get("permalink_url"),
-                            "full_picture": v.get("picture"),
-                            "status_type": "video",
-                        })
-                        if len(videos) >= limit:
-                            break
-                url = (data.get("paging") or {}).get("next")
-                params = None
-            if len(videos) >= limit:
+        while url and len(videos) < limit:
+            if url in visited:
                 break
+            visited.add(url)
+            try:
+                r = await client.get(url, params=params if first else None)
+            except Exception as e:
+                warning = str(e)
+                break
+            first = False
+            try:
+                data = r.json()
+            except Exception:
+                warning = "Bukan JSON"
+                break
+            if not isinstance(data, dict) or "error" in data:
+                warning = (data.get("error") or {}).get("message", "API error")
+                break
+            for v in data.get("data", []):
+                if not isinstance(v, dict) or not v.get("id"):
+                    continue
+                vid = v["id"]
+                if vid in seen:
+                    continue
+                seen.add(vid)
+                videos.append({
+                    "id": vid,
+                    "message": v.get("title") or v.get("description") or "(video)",
+                    "created_time": v.get("created_time"),
+                    "permalink_url": v.get("permalink_url"),
+                    "full_picture": v.get("picture"),
+                    "status_type": "video",
+                })
+                if len(videos) >= limit:
+                    break
+            url = (data.get("paging") or {}).get("next")
+            params = None
 
     return {
         "page_id": page_id,
