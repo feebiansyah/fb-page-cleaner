@@ -26,9 +26,10 @@
         <button onclick="logout()" class="text-sm text-red-600">Logout</button>
       </div>
       <div id="pages" class="space-y-2"></div>
-      <div class="mt-4 flex gap-3 items-center">
+      <div class="mt-4 flex gap-2 items-center">
+        <input type="number" id="post-limit" min="0" placeholder="semua" class="border rounded px-2 py-1 w-24" />
+        <span class="text-sm">maks per page</span>
         <button id="load-btn" onclick="loadPosts()" class="bg-green-600 text-white px-5 py-2 rounded hover:bg-green-700">Load Posts</button>
-        <span class="text-xs text-gray-500">Mengambil semua postingan (termasuk video &amp; reels), kecuali story.</span>
       </div>
     </div>
 
@@ -103,12 +104,13 @@ function renderPages(pages) {
 async function loadPosts() {
   const pageIds = Array.from(document.querySelectorAll(".page-check:checked")).map(cb => cb.value);
   if (!pageIds.length) return alert("Pilih minimal 1 Page");
+  const limit = parseInt(document.getElementById("post-limit").value) || 0;
 
   const btn = document.getElementById("load-btn");
   const postsEl = document.getElementById("posts");
   const statusEl = document.getElementById("load-status");
   document.getElementById("posts-area").classList.remove("hidden");
-  postsEl.textContent = "Memuat semua postingan, mohon tunggu...";
+  postsEl.textContent = "Memuat postingan, mohon tunggu...";
   statusEl.textContent = "";
   document.getElementById("total-count").textContent = "";
   btn.disabled = true;
@@ -118,7 +120,7 @@ async function loadPosts() {
     const res = await fetch("/api/load/start", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ session_id: sessionId, page_ids: pageIds })
+      body: JSON.stringify({ session_id: sessionId, page_ids: pageIds, limit })
     });
     const started = await res.json();
     if (!res.ok) throw new Error(started.detail || "Error");

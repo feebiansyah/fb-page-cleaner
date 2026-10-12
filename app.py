@@ -56,6 +56,7 @@ class DeleteRequest(BaseModel):
 class LoadRequest(BaseModel):
     session_id: str
     page_ids: List[str]
+    limit: int = 0   # 0 = ambil semua
 
 
 # ------------------------------------------------------------------ helpers
@@ -91,8 +92,9 @@ def set_limit(url: str, limit: int) -> str:
     return urlunparse(p._replace(query=urlencode(q)))
 
 
-async def fetch_all(client: httpx.AsyncClient, url: str, params: dict, page_size: int = 100) -> List[dict]:
-    """Ambil semua halaman dari satu edge sampai habis."""
+async def fetch_all(client: httpx.AsyncClient, url: str, params: dict,
+                    page_size: int = 100, max_items: int = 0) -> List[dict]:
+    """Ambil semua halaman dari satu edge sampai habis (atau sampai max_items)."""
     items: List[dict] = []
     cur_url: Optional[str] = url
     cur_params: Optional[dict] = dict(params, limit=page_size)
@@ -117,6 +119,8 @@ async def fetch_all(client: httpx.AsyncClient, url: str, params: dict, page_size
                 continue
             raise
         items.extend(x for x in data.get("data", []) if isinstance(x, dict))
+        if max_items and len(items) >= max_items:
+            break
         nxt = (data.get("paging") or {}).get("next")
         if nxt and reduced:
             nxt = set_limit(nxt, page_size)
@@ -173,7 +177,7 @@ def abs_url(u: Optional[str]) -> Optional[str]:
     return u if u.startswith("http") else FB_WEB + u
 
 
-async def load_page_posts(client, page: dict, job: dict) -> List[dict]:
+async def load_page_posts(client, page: dict, job: dict, limit: int = 0) -> List[dict]:
     page_id, name, token = str(page["id"]), page.get("name", ""), page["access_token"]
 
     def log(msg: str):
@@ -185,6 +189,9 @@ async def load_page_posts(client, page: dict, job: dict) -> List[dict]:
     collected: Dict[str, dict] = {}
     targets: Set[str] = set()
     skipped_story = 0
+
+    def need_more() -> bool:
+        return not limit or len(collected) < limit
 
     def add_posts(raw: List[dict]):
         nonlocal skipped_story
@@ -207,7 +214,10 @@ async def load_page_posts(client, page: dict, job: dict) -> List[dict]:
 
     # Pass A: pagination biasa
     try:
-        raw = await fetch_all(client, url, {"fields": POST_FIELDS, "access_token": token})
+        raw = await fetch_all(
+            client, url, {"fields": POST_FIELDS, "access_token": token},
+            max_items=(limit + len(story_ids) + 20) if limit else 0,
+        )
         add_posts(raw)
         log(f"Pass A (paging biasa): {len(collected)} postingan")
     except FBError as e:
@@ -219,7 +229,7 @@ async def load_page_posts(client, page: dict, job: dict) -> List[dict]:
     empty = 0
     n_win = 0
     try:
-        while until > MIN_TS and empty < MAX_EMPTY_WINDOWS:
+        while need_more() and until > MIN_TS and empty < MAX_EMPTY_WINDOWS:
             since = until - WINDOW_SECONDS
             raw = await fetch_window(client, url, token, since, until)
             before = len(collected)
@@ -239,48 +249,50 @@ async def load_page_posts(client, page: dict, job: dict) -> List[dict]:
 
     # Video
     added_v = 0
-    try:
-        vids = await fetch_all(client, f"{BASE_URL}/{page_id}/videos", {
-            "fields": "id,description,created_time,permalink_url,picture",
-            "access_token": token,
-        })
-        for v in vids:
-            vid = str(v.get("id", ""))
-            if not vid or vid in known or vid in story_ids:
-                continue
-            known.add(vid)
-            collected[vid] = {
-                "id": vid, "message": v.get("description") or "(Video)",
-                "created_time": v.get("created_time"),
-                "permalink_url": abs_url(v.get("permalink_url")) or f"{FB_WEB}/watch/?v={vid}",
-                "full_picture": v.get("picture"), "type": "video",
-            }
-            added_v += 1
-    except FBError as e:
-        job["warnings"].append(f"{name}: videos - {e.message}")
+    if need_more():
+        try:
+            vids = await fetch_all(client, f"{BASE_URL}/{page_id}/videos", {
+                "fields": "id,description,created_time,permalink_url,picture",
+                "access_token": token,
+            })
+            for v in vids:
+                vid = str(v.get("id", ""))
+                if not vid or vid in known or vid in story_ids:
+                    continue
+                known.add(vid)
+                collected[vid] = {
+                    "id": vid, "message": v.get("description") or "(Video)",
+                    "created_time": v.get("created_time"),
+                    "permalink_url": abs_url(v.get("permalink_url")) or f"{FB_WEB}/watch/?v={vid}",
+                    "full_picture": v.get("picture"), "type": "video",
+                }
+                added_v += 1
+        except FBError as e:
+            job["warnings"].append(f"{name}: videos - {e.message}")
     log(f"Video tambahan (belum ada di feed): {added_v}")
 
     # Reels
     added_r = 0
-    try:
-        reels = await fetch_all(client, f"{BASE_URL}/{page_id}/video_reels", {
-            "fields": "id,description,updated_time",
-            "access_token": token,
-        })
-        for rl in reels:
-            rid = str(rl.get("id", ""))
-            if not rid or rid in known or rid in story_ids:
-                continue
-            known.add(rid)
-            collected[rid] = {
-                "id": rid, "message": rl.get("description") or "(Reel)",
-                "created_time": rl.get("updated_time"),
-                "permalink_url": f"{FB_WEB}/reel/{rid}",
-                "full_picture": None, "type": "reel",
-            }
-            added_r += 1
-    except FBError as e:
-        job["warnings"].append(f"{name}: reels - {e.message}")
+    if need_more():
+        try:
+            reels = await fetch_all(client, f"{BASE_URL}/{page_id}/video_reels", {
+                "fields": "id,description,updated_time",
+                "access_token": token,
+            })
+            for rl in reels:
+                rid = str(rl.get("id", ""))
+                if not rid or rid in known or rid in story_ids:
+                    continue
+                known.add(rid)
+                collected[rid] = {
+                    "id": rid, "message": rl.get("description") or "(Reel)",
+                    "created_time": rl.get("updated_time"),
+                    "permalink_url": f"{FB_WEB}/reel/{rid}",
+                    "full_picture": None, "type": "reel",
+                }
+                added_r += 1
+        except FBError as e:
+            job["warnings"].append(f"{name}: reels - {e.message}")
     log(f"Reels tambahan: {added_r}")
 
     if skipped_story:
@@ -288,6 +300,8 @@ async def load_page_posts(client, page: dict, job: dict) -> List[dict]:
 
     result = list(collected.values())
     result.sort(key=lambda x: x.get("created_time") or "", reverse=True)
+    if limit:
+        result = result[:limit]
     for p in result:
         p["_pageId"] = page_id
         p["_pageName"] = name
@@ -301,6 +315,7 @@ async def run_load_job(job_id: str, req: LoadRequest):
         job.update(status="error", error="Session expired")
         return
     pages = {str(p["id"]): p for p in sess["pages"]}
+    limit = max(0, int(req.limit or 0))
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
             for pid in req.page_ids:
@@ -311,7 +326,7 @@ async def run_load_job(job_id: str, req: LoadRequest):
                     continue
                 job["current"] = page.get("name", pid)
                 try:
-                    posts = await load_page_posts(client, page, job)
+                    posts = await load_page_posts(client, page, job, limit)
                     job["posts"].extend(posts)
                     job["log"].append(f"[{page.get('name')}] SELESAI: {len(posts)} item")
                 except Exception as exc:
