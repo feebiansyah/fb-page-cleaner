@@ -25,9 +25,10 @@ GRAPH_VERSION = os.environ.get("GRAPH_VERSION", "v26.0")
 BASE_URL = f"https://graph.facebook.com/{GRAPH_VERSION}"
 FB_WEB = "https://www.facebook.com"
 
-POST_FIELDS = (
-    "id,message,created_time,permalink_url,status_type,full_picture,"
-    "attachments{media_type,type,target{id},subattachments{target{id},media_type}}"
+POST_FIELDS = "id,message,created_time,permalink_url,full_picture,attachments{target{id}}"
+REEL_FIELDS_TRY = (
+    "id,description,created_time,updated_time,picture,permalink_url",
+    "id,description,updated_time",
 )
 RATE_LIMIT_CODES = {2, 4, 17, 32, 341, 613, 80001, 80004}
 WINDOW_SECONDS = 90 * 86400
@@ -74,13 +75,12 @@ async def fb_get(client: httpx.AsyncClient, url: str, params: Optional[dict] = N
             data = r.json()
         except Exception as exc:
             last_msg = str(exc) or exc.__class__.__name__
-            await asyncio.sleep(1.5 * (attempt + 1))
+            await asyncio.sleep(1.0 * (attempt + 1))
             continue
         if isinstance(data, dict) and "error" in data:
             err = data["error"] or {}
             last_msg = err.get("message", "API error")
             last_code = err.get("code")
-            # Terlalu banyak data: langsung gagal cepat agar jumlah per request dikurangi
             if too_much_data(last_msg, last_code):
                 raise FBError(last_msg, last_code)
             if last_code in RATE_LIMIT_CODES or err.get("is_transient"):
@@ -101,7 +101,7 @@ def set_limit(url: str, limit: int) -> str:
 
 
 async def fetch_all(client: httpx.AsyncClient, url: str, params: dict,
-                    page_size: int = 100, max_items: int = 0) -> List[dict]:
+                    page_size: int = 100, max_items: int = 0, on_items=None) -> List[dict]:
     """Ambil semua halaman dari satu edge sampai habis (atau sampai max_items)."""
     items: List[dict] = []
     cur_url: Optional[str] = url
@@ -126,7 +126,10 @@ async def fetch_all(client: httpx.AsyncClient, url: str, params: dict,
                     cur_url = set_limit(cur_url, page_size)
                 continue
             raise
-        items.extend(x for x in data.get("data", []) if isinstance(x, dict))
+        batch = [x for x in data.get("data", []) if isinstance(x, dict)]
+        items.extend(batch)
+        if on_items:
+            on_items(len(items))
         if max_items and len(items) >= max_items:
             break
         nxt = (data.get("paging") or {}).get("next")
@@ -148,34 +151,12 @@ async def fetch_window(client, url, token, since: int, until: int) -> List[dict]
     return items
 
 
-async def get_story_ids(client: httpx.AsyncClient, page_id: str, token: str) -> Set[str]:
-    ids: Set[str] = set()
-    for fields in ("post_id,media_id", "post_id"):
-        try:
-            items = await fetch_all(client, f"{BASE_URL}/{page_id}/stories",
-                                    {"fields": fields, "access_token": token})
-        except FBError:
-            continue
-        for it in items:
-            for k in ("post_id", "media_id", "id"):
-                v = it.get(k)
-                if v:
-                    ids.add(str(v))
-                    ids.add(str(v).split("_")[-1])
-        break
-    return ids
-
-
 def collect_targets(p: dict) -> Set[str]:
     out: Set[str] = set()
     for a in (p.get("attachments") or {}).get("data", []) or []:
         t = (a.get("target") or {}).get("id")
         if t:
             out.add(str(t))
-        for s in (a.get("subattachments") or {}).get("data", []) or []:
-            t2 = (s.get("target") or {}).get("id")
-            if t2:
-                out.add(str(t2))
     return out
 
 
@@ -200,149 +181,114 @@ async def load_page_posts(client, page: dict, job: dict, limit: int = 0) -> List
     def log(msg: str):
         job["log"].append(f"[{name}] {msg}")
 
-    log("Mengecek story aktif...")
-    story_ids = await get_story_ids(client, page_id, token)
-    log(f"Story aktif dikecualikan: {len(story_ids) // 2 if story_ids else 0}")
-
-    collected: Dict[str, dict] = {}
-    targets: Set[str] = set()
-    skipped_story = 0
-
-    def need_more() -> bool:
-        return not limit or len(collected) < limit
+    counts = {"posts": 0, "reels": 0}
 
     def sync():
-        job["live"] = len(collected)
+        job["live"] = counts["posts"] + counts["reels"]
 
-    def add_posts(raw: List[dict]):
-        nonlocal skipped_story
-        for p in raw:
-            pid = p.get("id")
-            if not pid:
-                continue
-            pid = str(pid)
-            part = pid.split("_")[-1]
-            tg = collect_targets(p)
-            if pid in story_ids or part in story_ids or (tg & story_ids):
-                skipped_story += 1
-                continue
-            targets.update(tg)
-            p["type"] = "post"
-            p["permalink_url"] = abs_url(p.get("permalink_url"))
-            collected.setdefault(pid, p)
-        sync()
-
-    url = f"{BASE_URL}/{page_id}/published_posts"
-
-    # Pass A: pagination biasa
-    log("Mengambil postingan biasa (Pass A)...")
-    a_ok = False
-    raw_a: List[dict] = []
-    try:
-        raw_a = await fetch_all(
-            client, url, {"fields": POST_FIELDS, "access_token": token},
-            max_items=(limit + len(story_ids) + 20) if limit else 0,
-        )
-        add_posts(raw_a)
-        a_ok = True
-        log(f"Pass A (paging biasa): {len(collected)} postingan")
-    except FBError as e:
-        job["warnings"].append(f"{name}: pass A gagal - {e.message}")
-        log(f"Pass A gagal: {e.message}")
-
-    # Pass B: jendela waktu, hanya jika Pass A kemungkinan terpotong
-    run_b = need_more() and (not a_ok or len(raw_a) >= PASS_B_MIN)
-    if run_b:
-        until = int(time.time()) + 86400
-        if a_ok:
-            stamps = [t for t in (parse_ts(x.get("created_time")) for x in raw_a) if t]
-            if stamps:
-                until = min(stamps) + 86400
-        empty = 0
-        n_win = 0
+    # ---------------- Postingan biasa
+    async def get_posts() -> List[dict]:
+        url = f"{BASE_URL}/{page_id}/published_posts"
+        raw: List[dict] = []
+        a_ok = False
         try:
-            while need_more() and until > MIN_TS and empty < MAX_EMPTY_WINDOWS:
-                since = until - WINDOW_SECONDS
-                raw = await fetch_window(client, url, token, since, until)
-                before = len(collected)
-                add_posts(raw)
-                empty = empty + 1 if not raw else 0
-                n_win += 1
-                if len(collected) > before:
-                    d = datetime.fromtimestamp(since).strftime("%Y-%m-%d")
-                    log(f"Jendela {d}: +{len(collected) - before} (total {len(collected)})")
-                until = since
-            log(f"Pass B ({n_win} jendela): total {len(collected)} postingan")
-        except FBError as e:
-            job["warnings"].append(f"{name}: pass B gagal - {e.message}")
-            log(f"Pass B gagal: {e.message}")
-    else:
-        log("Pass B dilewati (Pass A sudah tuntas)")
-
-    known = {k.split("_")[-1] for k in collected} | targets
-
-    # Reels dulu (supaya label REEL benar, karena Reels juga muncul di endpoint video)
-    log("Mengambil Reels...")
-    added_r = 0
-    try:
-        reels = await fetch_all(
-            client, f"{BASE_URL}/{page_id}/video_reels",
-            {"fields": "id,description,updated_time", "access_token": token},
-            page_size=50, max_items=limit,
-        )
-        for rl in reels:
-            rid = str(rl.get("id", ""))
-            if not rid or rid in known or rid in story_ids:
-                continue
-            known.add(rid)
-            collected[rid] = {
-                "id": rid, "message": rl.get("description") or "(Reel)",
-                "created_time": rl.get("updated_time"),
-                "permalink_url": f"{FB_WEB}/reel/{rid}",
-                "full_picture": None, "type": "reel",
-            }
-            added_r += 1
-        sync()
-    except FBError as e:
-        job["warnings"].append(f"{name}: reels - {e.message}")
-    log(f"Reels: {added_r}")
-
-    # Video biasa (coba lengkap dulu, kalau ditolak pakai versi ringan)
-    log("Mengambil video...")
-    added_v = 0
-    vids: List[dict] = []
-    vid_err: Optional[FBError] = None
-    for fields, size in (("id,description,created_time,picture,permalink_url", 10),
-                         ("id,created_time", 25)):
-        try:
-            vids = await fetch_all(
-                client, f"{BASE_URL}/{page_id}/videos",
-                {"fields": fields, "access_token": token},
-                page_size=size, max_items=limit,
+            raw = await fetch_all(
+                client, url, {"fields": POST_FIELDS, "access_token": token},
+                max_items=limit, on_items=lambda n: (counts.__setitem__("posts", n), sync()),
             )
-            vid_err = None
-            break
+            a_ok = True
+            log(f"Postingan (Pass A): {len(raw)}")
         except FBError as e:
-            vid_err = e
-    if vid_err:
-        job["warnings"].append(f"{name}: videos dilewati - {vid_err.message}")
-    for v in vids:
-        vid = str(v.get("id", ""))
-        if not vid or vid in known or vid in story_ids:
-            continue
-        known.add(vid)
-        collected[vid] = {
-            "id": vid, "message": v.get("description") or "(Video)",
-            "created_time": v.get("created_time"),
-            "permalink_url": abs_url(v.get("permalink_url")) or f"{FB_WEB}/watch/?v={vid}",
-            "full_picture": v.get("picture"), "type": "video",
-        }
-        added_v += 1
-    sync()
-    log(f"Video (bukan reel, belum ada di feed): {added_v}")
+            job["warnings"].append(f"{name}: postingan gagal - {e.message}")
+            log(f"Postingan gagal: {e.message}")
 
-    if skipped_story:
-        log(f"Item story terlewati: {skipped_story}")
+        by_id: Dict[str, dict] = {str(p["id"]): p for p in raw if p.get("id")}
+
+        # Pass B hanya jika kemungkinan terpotong
+        if (not limit or len(by_id) < limit) and (not a_ok or len(raw) >= PASS_B_MIN):
+            until = int(time.time()) + 86400
+            if a_ok:
+                stamps = [t for t in (parse_ts(x.get("created_time")) for x in raw) if t]
+                if stamps:
+                    until = min(stamps) + 86400
+            empty, n_win = 0, 0
+            try:
+                while (not limit or len(by_id) < limit) and until > MIN_TS and empty < MAX_EMPTY_WINDOWS:
+                    since = until - WINDOW_SECONDS
+                    w = await fetch_window(client, url, token, since, until)
+                    before = len(by_id)
+                    for p in w:
+                        if p.get("id"):
+                            by_id.setdefault(str(p["id"]), p)
+                    counts["posts"] = len(by_id)
+                    sync()
+                    empty = empty + 1 if not w else 0
+                    n_win += 1
+                    if len(by_id) > before:
+                        d = datetime.fromtimestamp(since).strftime("%Y-%m-%d")
+                        log(f"Jendela {d}: +{len(by_id) - before} (total {len(by_id)})")
+                    until = since
+                log(f"Pass B ({n_win} jendela): total {len(by_id)} postingan")
+            except FBError as e:
+                job["warnings"].append(f"{name}: pass B gagal - {e.message}")
+                log(f"Pass B gagal: {e.message}")
+        else:
+            log("Pass B dilewati (Pass A sudah tuntas)")
+        return list(by_id.values())
+
+    # ---------------- Reels
+    async def get_reels() -> List[dict]:
+        last: Optional[FBError] = None
+        for fields in REEL_FIELDS_TRY:
+            try:
+                reels = await fetch_all(
+                    client, f"{BASE_URL}/{page_id}/video_reels",
+                    {"fields": fields, "access_token": token},
+                    page_size=50, max_items=limit,
+                    on_items=lambda n: (counts.__setitem__("reels", n), sync()),
+                )
+                log(f"Reels: {len(reels)}")
+                return reels
+            except FBError as e:
+                last = e
+        job["warnings"].append(f"{name}: reels gagal - {last.message if last else '?'}")
+        log("Reels gagal diambil")
+        return []
+
+    log("Mengambil postingan dan Reels bersamaan...")
+    raw_posts, raw_reels = await asyncio.gather(get_posts(), get_reels())
+
+    # ---------------- Gabungkan tanpa duplikat
+    collected: Dict[str, dict] = {}
+    reel_ids: Set[str] = set()
+    for rl in raw_reels:
+        rid = str(rl.get("id", ""))
+        if not rid:
+            continue
+        reel_ids.add(rid)
+        collected[rid] = {
+            "id": rid,
+            "message": rl.get("description") or "(Reel)",
+            "created_time": rl.get("created_time") or rl.get("updated_time"),
+            "permalink_url": abs_url(rl.get("permalink_url")) or f"{FB_WEB}/reel/{rid}",
+            "full_picture": rl.get("picture"),
+            "type": "reel",
+        }
+
+    dup = 0
+    for p in raw_posts:
+        pid = str(p.get("id", ""))
+        if not pid:
+            continue
+        if collect_targets(p) & reel_ids or pid.split("_")[-1] in reel_ids:
+            dup += 1          # sudah ada sebagai Reel
+            continue
+        p["type"] = "post"
+        p["permalink_url"] = abs_url(p.get("permalink_url"))
+        p.pop("attachments", None)
+        collected.setdefault(pid, p)
+    if dup:
+        log(f"Duplikat Reels di feed digabung: {dup}")
 
     result = list(collected.values())
     result.sort(key=lambda x: x.get("created_time") or "", reverse=True)
