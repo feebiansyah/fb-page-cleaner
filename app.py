@@ -32,7 +32,8 @@ POST_FIELDS = (
 TRANSIENT_CODES = {2, 4, 17, 32, 341, 613, 80001, 80004}
 WINDOW_SECONDS = 90 * 86400
 SPLIT_THRESHOLD = 400          # jika 1 jendela >= ini, dipecah dua
-MAX_EMPTY_WINDOWS = 16         # 16 x 90 hari ≈ 4 tahun kosong berturut-turut -> berhenti
+MAX_EMPTY_WINDOWS = 6          # 6 x 90 hari kosong berturut-turut -> berhenti
+PASS_B_MIN = 90                # Pass B hanya jalan jika Pass A >= ini (indikasi terpotong)
 MIN_TS = 1075593600            # 2004-02-01
 
 
@@ -177,6 +178,15 @@ def abs_url(u: Optional[str]) -> Optional[str]:
     return u if u.startswith("http") else FB_WEB + u
 
 
+def parse_ts(s: Optional[str]) -> Optional[int]:
+    if not s:
+        return None
+    try:
+        return int(datetime.strptime(s, "%Y-%m-%dT%H:%M:%S%z").timestamp())
+    except Exception:
+        return None
+
+
 async def load_page_posts(client, page: dict, job: dict, limit: int = 0) -> List[dict]:
     page_id, name, token = str(page["id"]), page.get("name", ""), page["access_token"]
 
@@ -213,72 +223,85 @@ async def load_page_posts(client, page: dict, job: dict, limit: int = 0) -> List
     url = f"{BASE_URL}/{page_id}/published_posts"
 
     # Pass A: pagination biasa
+    a_ok = False
+    raw_a: List[dict] = []
     try:
-        raw = await fetch_all(
+        raw_a = await fetch_all(
             client, url, {"fields": POST_FIELDS, "access_token": token},
             max_items=(limit + len(story_ids) + 20) if limit else 0,
         )
-        add_posts(raw)
+        add_posts(raw_a)
+        a_ok = True
         log(f"Pass A (paging biasa): {len(collected)} postingan")
     except FBError as e:
         job["warnings"].append(f"{name}: pass A gagal - {e.message}")
         log(f"Pass A gagal: {e.message}")
 
-    # Pass B: jendela waktu (menembus batas kedalaman paging Facebook)
-    until = int(time.time()) + 86400
-    empty = 0
-    n_win = 0
-    try:
-        while need_more() and until > MIN_TS and empty < MAX_EMPTY_WINDOWS:
-            since = until - WINDOW_SECONDS
-            raw = await fetch_window(client, url, token, since, until)
-            before = len(collected)
-            add_posts(raw)
-            empty = empty + 1 if not raw else 0
-            n_win += 1
-            if len(collected) > before:
-                d = datetime.fromtimestamp(since).strftime("%Y-%m-%d")
-                log(f"Jendela {d}: +{len(collected) - before} (total {len(collected)})")
-            until = since
-        log(f"Pass B (jendela waktu, {n_win} jendela): total {len(collected)} postingan")
-    except FBError as e:
-        job["warnings"].append(f"{name}: pass B gagal - {e.message}")
-        log(f"Pass B gagal: {e.message}")
+    # Pass B: jendela waktu, hanya jika Pass A kemungkinan terpotong
+    run_b = need_more() and (not a_ok or len(raw_a) >= PASS_B_MIN)
+    if run_b:
+        until = int(time.time()) + 86400
+        if a_ok:
+            stamps = [t for t in (parse_ts(x.get("created_time")) for x in raw_a) if t]
+            if stamps:
+                until = min(stamps) + 86400   # mulai dari postingan tertua hasil Pass A
+        empty = 0
+        n_win = 0
+        try:
+            while need_more() and until > MIN_TS and empty < MAX_EMPTY_WINDOWS:
+                since = until - WINDOW_SECONDS
+                raw = await fetch_window(client, url, token, since, until)
+                before = len(collected)
+                add_posts(raw)
+                empty = empty + 1 if not raw else 0
+                n_win += 1
+                if len(collected) > before:
+                    d = datetime.fromtimestamp(since).strftime("%Y-%m-%d")
+                    log(f"Jendela {d}: +{len(collected) - before} (total {len(collected)})")
+                until = since
+            log(f"Pass B ({n_win} jendela): total {len(collected)} postingan")
+        except FBError as e:
+            job["warnings"].append(f"{name}: pass B gagal - {e.message}")
+            log(f"Pass B gagal: {e.message}")
+    else:
+        log("Pass B dilewati (Pass A sudah tuntas)")
 
     known = {k.split("_")[-1] for k in collected} | targets
 
-    # Video
+    # Video (request ringan)
     added_v = 0
     if need_more():
         try:
-            vids = await fetch_all(client, f"{BASE_URL}/{page_id}/videos", {
-                "fields": "id,description,created_time,permalink_url,picture",
-                "access_token": token,
-            })
+            vids = await fetch_all(
+                client, f"{BASE_URL}/{page_id}/videos",
+                {"fields": "id,created_time", "access_token": token},
+                page_size=25, max_items=limit,
+            )
             for v in vids:
                 vid = str(v.get("id", ""))
                 if not vid or vid in known or vid in story_ids:
                     continue
                 known.add(vid)
                 collected[vid] = {
-                    "id": vid, "message": v.get("description") or "(Video)",
+                    "id": vid, "message": "(Video)",
                     "created_time": v.get("created_time"),
-                    "permalink_url": abs_url(v.get("permalink_url")) or f"{FB_WEB}/watch/?v={vid}",
-                    "full_picture": v.get("picture"), "type": "video",
+                    "permalink_url": f"{FB_WEB}/watch/?v={vid}",
+                    "full_picture": None, "type": "video",
                 }
                 added_v += 1
         except FBError as e:
-            job["warnings"].append(f"{name}: videos - {e.message}")
+            job["warnings"].append(f"{name}: videos dilewati - {e.message}")
     log(f"Video tambahan (belum ada di feed): {added_v}")
 
     # Reels
     added_r = 0
     if need_more():
         try:
-            reels = await fetch_all(client, f"{BASE_URL}/{page_id}/video_reels", {
-                "fields": "id,description,updated_time",
-                "access_token": token,
-            })
+            reels = await fetch_all(
+                client, f"{BASE_URL}/{page_id}/video_reels",
+                {"fields": "id,description,updated_time", "access_token": token},
+                max_items=limit,
+            )
             for rl in reels:
                 rid = str(rl.get("id", ""))
                 if not rid or rid in known or rid in story_ids:
