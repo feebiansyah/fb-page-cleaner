@@ -10,6 +10,7 @@ import secrets
 import time
 from typing import List, Dict, Any, Optional
 from datetime import datetime
+from time import monotonic as posts_load_clock
 from urllib.parse import unquote
 
 import httpx
@@ -139,9 +140,10 @@ async def get_posts(
     if since and until and since > until:
         raise HTTPException(422, "Tanggal sejak melebihi tanggal akhir")
 
+    page_size = min(limit, 25)
     params = {
         "fields": "id,message,created_time,permalink_url,status_type,full_picture,attachments{media,type,title,description,url}",
-        "limit": min(limit, 100),
+        "limit": page_size,
         "access_token": page["access_token"],
     }
     if since:
@@ -154,27 +156,35 @@ async def get_posts(
     reason, failure = "no_next", None
     upstream_status = meta_code = meta_subcode = None
     tokens = [sess.get("user_token")] + [p.get("access_token") for p in sess["pages"]]
-    # A finite request budget also covers empty pages and duplicate-only pages.
-    # Allow normal 100-item batches plus headroom for empty/duplicate pages.
-    budget = max(20, 2 * ((limit + 99) // 100))
-    url = httpx.URL(f"{BASE_URL}/{page_id}/posts")
+    # Enough for 5-item pages, two reductions, and empty/duplicate-page headroom.
+    # Both successful requests and failed attempts consume this finite budget.
+    budget = max(20, 2 * ((limit + 4) // 5) + 2)
+    deadline = posts_load_clock() + 900.0
+    url = httpx.URL(f"{BASE_URL}/{page_id}/posts", params=params)
     async with httpx.AsyncClient(timeout=30.0) as client:
         while url and len(posts) < limit:
-            key = str(url.copy_with(params=sorted(url.params.multi_items())))
-            cursor = url.params.get("after")
+            # Preserve incoming pagination, filling only missing original fields/filters/token.
+            for name, value in params.items():
+                if name != "limit" and name not in url.params:
+                    url = url.copy_set_param(name, value)
+            url = url.copy_set_param("limit", page_size)
+            # Page identity excludes size: a smaller retry is still the same page.
+            key = str(url.copy_with(params=sorted(url.params.remove("limit").multi_items())))
+            cursor = next(((name, url.params[name]) for name in ("after", "before") if url.params.get(name)), None)
             if key in visited or (cursor and cursor in cursors):
                 reason, failure = "repeated_pagination", "Pagination berulang; pemuatan dihentikan"
                 break
             if requests >= budget:
                 reason, failure = "request_budget", "Batas request pemuatan tercapai"
                 break
-            visited.add(key)
-            if cursor:
-                cursors.add(cursor)
+            remaining = deadline - posts_load_clock()
+            if remaining <= 0:
+                reason, failure = "duration_budget", "Batas durasi pemuatan 15 menit tercapai"
+                break
             requests += 1
             upstream_status = meta_code = meta_subcode = None
             try:
-                r = await client.get(url, params=params if requests == 1 else None)
+                r = await asyncio.wait_for(client.get(url, timeout=min(30.0, remaining)), timeout=remaining)
                 upstream_status = r.status_code
                 try:
                     data = r.json()
@@ -191,6 +201,17 @@ async def get_posts(
                     detail = f"Meta API HTTP {r.status_code}" if not r.is_success else "Meta Graph menolak pemuatan"
                     if message:
                         detail += ": " + message
+                    # This retry is only for Meta's explicit reduce-data instruction.
+                    # Auth/permission/rate-limit signals always retain their original diagnosis.
+                    raw_message = error.get("message") if isinstance(error, dict) else None
+                    reduce_data = isinstance(raw_message, str) and "please reduce the amount of data you're asking for" in " ".join(raw_message.lower().replace("\u2019", "'").split())
+                    excluded = r.status_code in (401, 403, 429) or meta_code in (4, 10, 17, 32, 190, 200, 294, 613, 80004)
+                    if reduce_data and not excluded:
+                        if page_size > 5:
+                            page_size = 10 if page_size > 10 else 5
+                            # No visited mark or cursor advance until this page succeeds.
+                            continue
+                        reason = "reduce_data_exhausted"
                     raise HTTPException(502, detail)
                 reason = "invalid_response"
                 if not isinstance(data, dict):
@@ -198,6 +219,9 @@ async def get_posts(
                 items = data.get("data")
                 if not isinstance(items, list) or any(not isinstance(p, dict) or not isinstance(p.get("id"), str) or not p["id"] for p in items):
                     raise HTTPException(502, "Data postingan Meta tidak valid")
+                visited.add(key)
+                if cursor:
+                    cursors.add(cursor)
                 pages += 1
                 received += len(items)
                 for post in items:
@@ -223,6 +247,9 @@ async def get_posts(
                     raise HTTPException(502, "Pagination Meta tidak valid")
                 if url.scheme != "https" or url.host != "graph.facebook.com" or url.userinfo or url.port not in (None, 443):
                     raise HTTPException(502, "Tujuan pagination Meta tidak valid")
+            except asyncio.TimeoutError:
+                reason, failure = "duration_budget", "Batas durasi pemuatan 15 menit tercapai"
+                break
             except httpx.TimeoutException:
                 reason, failure = "timeout", "Timeout saat menunggu Meta API"
                 break
@@ -233,7 +260,8 @@ async def get_posts(
                 failure = exc.detail
                 break
 
-    summary = {"requests": requests, "pages": pages, "items_received": received, "stop_reason": reason}
+    summary = {"requests": requests, "pages": pages, "items_received": received,
+               "loaded": len(posts), "page_size": page_size, "stop_reason": reason}
     diagnosis = None
     if failure:
         diagnosis = {"kind": reason, "upstream_status": upstream_status,

@@ -226,7 +226,7 @@ async function loadSelectedPages() {
         if (!current()) return;
         if (data?.summary) {
           const summary = data.summary;
-          messages.push(`${page.name}: requests=${summary.requests}, pages=${summary.pages}, stop_reason=${summary.stop_reason}`);
+          messages.push(`${page.name}: loaded=${summary.loaded}, requests=${summary.requests}, pages=${summary.pages}, page_size=${summary.page_size}, stop_reason=${summary.stop_reason}`);
         }
         if (!res.ok) throw new Error(`HTTP ${res.status}: ${postsLoadDiagnosis(data) || 'pemuatan ditolak atau gagal'}`);
         if (!data || !Array.isArray(data.posts) || data.posts.some(p => !p || typeof p.id !== 'string' || !p.id)) throw new Error('Struktur respons postingan tidak valid');
