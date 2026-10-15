@@ -35,6 +35,27 @@ class PostsTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result['partial'])
         self.assertEqual(result['summary'], {'requests': 2, 'pages': 2, 'items_received': 2, 'stop_reason': 'no_next'})
 
+    async def test_limit_5000_with_meta_batches_of_100(self):
+        payloads = []
+        for batch in range(50):
+            payloads.append((200, {
+                'data': [{'id': str(i)} for i in range(batch * 100, (batch + 1) * 100)],
+                'paging': {'next': app.BASE_URL + f'/p/posts?after={batch + 1}&limit=100'},
+            }))
+        result, calls = await self.load(payloads, limit=5000)
+        self.assertEqual(result['count'], 5000)
+        self.assertEqual(len({p['id'] for p in result['posts']}), 5000)
+        self.assertFalse(result['partial'])
+        self.assertEqual(result['summary']['stop_reason'], 'limit_reached')
+        self.assertEqual(len(calls), 50)
+        self.assertTrue(all(int(r.url.params['limit']) <= 100 for r in calls))
+
+    async def test_limit_5000_stops_when_source_exhausted(self):
+        result, calls = await self.load([(200, {'data': [{'id': '1'}]})], limit=5000)
+        self.assertEqual(result['count'], 1)
+        self.assertFalse(result['partial'])
+        self.assertEqual(len(calls), 1)
+
     async def test_empty_next_budget(self):
         payloads = [(200, {'data': [], 'paging': {'next': app.BASE_URL+f'/p/posts?after={i}'}}) for i in range(30)]
         with self.assertRaises(app.HTTPException) as caught:
@@ -68,7 +89,7 @@ class PostsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(calls), 2)
 
     async def test_validation(self):
-        for kwargs in ({'limit': 0}, {'since': '2026-02-30'}, {'since': '2026-2-01'}, {'since': '2026-02-01', 'until': '2026-01-01'}):
+        for kwargs in ({'limit': 0}, {'limit': 5001}, {'since': '2026-02-30'}, {'since': '2026-2-01'}, {'since': '2026-02-01', 'until': '2026-01-01'}):
             with self.subTest(kwargs=kwargs), self.assertRaises(app.HTTPException):
                 await self.load([], **kwargs)
 

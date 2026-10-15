@@ -107,8 +107,8 @@ async def get_posts(
     if not page or not page.get("access_token"):
         raise HTTPException(400, "Page token tidak ditemukan")
 
-    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1 or limit > 200:
-        raise HTTPException(422, "Limit harus antara 1 dan 200")
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1 or limit > 5000:
+        raise HTTPException(422, "Limit harus antara 1 dan 5000")
     for value in (since, until):
         if value is not None:
             try:
@@ -133,7 +133,8 @@ async def get_posts(
     requests = pages = received = 0
     reason, failure = "no_next", None
     # A finite request budget also covers empty pages and duplicate-only pages.
-    budget = 20
+    # Allow normal 100-item batches plus headroom for empty/duplicate pages.
+    budget = max(20, 2 * ((limit + 99) // 100))
     url = httpx.URL(f"{BASE_URL}/{page_id}/posts")
     async with httpx.AsyncClient(timeout=30.0) as client:
         while url and len(posts) < limit:
