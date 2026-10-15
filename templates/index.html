@@ -178,6 +178,16 @@ document.addEventListener('click', e => {
   if (e.target.closest('[onclick="logout()"]')) cancelPostsLoad();
 }, true);
 window.addEventListener('pagehide', cancelPostsLoad);
+function postsLoadDiagnosis(data) {
+  const diagnosis = data?.diagnosis;
+  const parts = [];
+  const message = diagnosis?.message || data?.detail || data?.warning;
+  if (typeof message === 'string') parts.push(message);
+  if (Number.isInteger(diagnosis?.upstream_status)) parts.push(`Meta HTTP ${diagnosis.upstream_status}`);
+  if (Number.isInteger(diagnosis?.meta_code)) parts.push(`kode ${diagnosis.meta_code}`);
+  if (Number.isInteger(diagnosis?.meta_subcode)) parts.push(`subkode ${diagnosis.meta_subcode}`);
+  return parts.join(' | ');
+}
 async function loadSelectedPages() {
   if (activePostsLoad && activePostsLoad.session === sessionId) return;
   cancelPostsLoad();
@@ -214,9 +224,13 @@ async function loadSelectedPages() {
         try { data = await res.json(); }
         catch { throw new Error(`Respons bukan JSON valid (HTTP ${res.status})`); }
         if (!current()) return;
-        if (!res.ok) throw new Error(`HTTP ${res.status}: pemuatan ditolak atau gagal`);
+        if (data?.summary) {
+          const summary = data.summary;
+          messages.push(`${page.name}: requests=${summary.requests}, pages=${summary.pages}, stop_reason=${summary.stop_reason}`);
+        }
+        if (!res.ok) throw new Error(`HTTP ${res.status}: ${postsLoadDiagnosis(data) || 'pemuatan ditolak atau gagal'}`);
         if (!data || !Array.isArray(data.posts) || data.posts.some(p => !p || typeof p.id !== 'string' || !p.id)) throw new Error('Struktur respons postingan tidak valid');
-        if (data.partial) messages.push(`${page.name}: Hasil parsial. ${data.warning || 'Pemuatan berhenti sebelum selesai'}`);
+        if (data.partial) messages.push(`${page.name}: Hasil parsial. ${postsLoadDiagnosis(data) || 'Pemuatan berhenti sebelum selesai'}`);
         else if (!data.posts.length) validEmpty++;
         for (const p of data.posts) {
           if (seenIds.has(p.id)) continue;

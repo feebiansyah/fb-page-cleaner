@@ -18,12 +18,13 @@ const response = (data, status=200) => ({ok:status===200,status,json:async()=>da
 const post = {id:'p_1',message:'visible',created_time:'2026-01-02',permalink_url:'https://example.com'};
 test('one page failure preserves posts and filter, never renders false empty',async()=>{
   let calls=[];
-  const s=setup(async url=>{calls.push(url);return calls.length===1 ? response({posts:[post]}) : response({detail:'secret'},500);});
+  const s=setup(async url=>{calls.push(url);return calls.length===1 ? response({posts:[post]}) : response({detail:'Meta API HTTP 500'},502);});
   await s.load();
   assert.match(s.elements.posts.innerHTML,/visible/);
   assert.doesNotMatch(s.elements.posts.innerHTML,/Tidak ada postingan/);
   assert.ok(s.elements.posts.children.some(e=>e.textContent.includes('Gagal memuat')));
   assert.ok(s.elements.posts.children.every(e=>!e.textContent.includes('secret')));
+  assert.ok(s.elements.posts.children.some(e=>e.textContent.includes('Meta API HTTP 500')));
   assert.ok(s.elements.posts.children.some(e=>e.textContent.includes('2026-01-01')));
   assert.match(calls[0],/limit=2&since=2026-01-01/);
   assert.equal(s.elements['load-posts'].disabled,false);
@@ -77,4 +78,18 @@ test('inputs are snapshotted and partial warning preserves checkbox/thumbnail co
   assert.match(s.elements.posts.innerHTML,/data-page="p"/);
   assert.match(s.elements.posts.innerHTML,/https:\/\/example.com\/thumb/);
   assert.ok(s.elements.posts.children.some(e=>e.textContent.includes('Hasil parsial')));
+});
+test('backend diagnosis and summary are visible as text for failures and partial results',async()=>{
+  for (const partial of [false,true]) {
+    const diagnosis={kind:'meta_http_error',upstream_status:403,meta_code:190,meta_subcode:463,message:'Permission denied <script> [redacted]'};
+    const summary={requests:2,pages:1,stop_reason:'meta_http_error'};
+    const s=setup(async()=>response(partial ? {posts:[post],partial:true,warning:diagnosis.message,diagnosis,summary} : {detail:diagnosis.message,diagnosis,summary}, partial ? 200 : 502));
+    await s.load();
+    const text=s.elements.posts.children.map(e=>e.textContent).join('\n');
+    assert.match(text,/Permission denied/);
+    assert.match(text,/403/); assert.match(text,/190/); assert.match(text,/463/);
+    assert.match(text,/requests=2/); assert.match(text,/pages=1/); assert.match(text,/stop_reason=meta_http_error/);
+    assert.doesNotMatch(s.elements.posts.innerHTML,/<script>/);
+    if(partial) assert.match(s.elements.posts.innerHTML,/visible/);
+  }
 });

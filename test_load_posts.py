@@ -1,3 +1,5 @@
+import asyncio
+import json
 import unittest
 from unittest.mock import patch
 import httpx
@@ -5,6 +7,36 @@ import app
 
 
 class PostsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_simultaneous_login_and_load_are_isolated(self):
+        users = ['USER_A' * 12, 'USER_B' * 12]
+        async def respond(request):
+            await asyncio.sleep(0)
+            token = request.url.params['access_token']
+            if request.url.path.endswith('/me/accounts'):
+                index = users.index(token)
+                return httpx.Response(200, json={'data': [{'id': 'p', 'name': f'Page {index}', 'access_token': f'PAGE_{index}'}]})
+            return httpx.Response(200, json={'data': [{'id': token + '_post'}]})
+        factory = httpx.AsyncClient
+        with patch.dict(app.SESSIONS, {}, clear=True), patch.object(app.time, 'time', return_value=1000), patch.object(app.httpx, 'AsyncClient', side_effect=lambda **kw: factory(transport=httpx.MockTransport(respond), **kw)):
+            logins = await asyncio.gather(*(app.login(user) for user in users))
+            self.assertNotEqual(logins[0]['session_id'], logins[1]['session_id'])
+            for i, login in enumerate(logins):
+                stored = app.SESSIONS[login['session_id']]
+                self.assertEqual(stored['user_token'], users[i])
+                self.assertEqual(stored['pages'][0]['access_token'], f'PAGE_{i}')
+                self.assertEqual(login['pages'][0]['name'], f'Page {i}')
+            results = await asyncio.gather(*(app.get_posts(login['session_id'], 'p') for login in logins))
+            self.assertEqual([r['posts'][0]['id'] for r in results], ['PAGE_0_post', 'PAGE_1_post'])
+
+    async def test_session_id_collision_does_not_overwrite(self):
+        factory = httpx.AsyncClient
+        transport = httpx.MockTransport(lambda req: httpx.Response(200, json={'data': []}))
+        with patch.dict(app.SESSIONS, {'existing': {'sentinel': True}}, clear=True), patch.object(app.secrets, 'token_urlsafe', side_effect=['existing', 'fresh']) as generate, patch.object(app.httpx, 'AsyncClient', side_effect=lambda **kw: factory(transport=transport, **kw)):
+            result = await app.login('X' * 60)
+            self.assertEqual(result['session_id'], 'fresh')
+            self.assertEqual(app.SESSIONS['existing'], {'sentinel': True})
+            self.assertEqual(generate.call_args_list, [unittest.mock.call(32), unittest.mock.call(32)])
+
     async def load(self, payloads, **kwargs):
         calls = []
         def respond(request):
@@ -28,6 +60,47 @@ class PostsTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(value=value), self.assertRaises(app.HTTPException) as caught:
                 await self.load([value])
             self.assertNotIn('SECRET', str(caught.exception.detail))
+
+    async def test_upstream_http_and_graph_diagnostics(self):
+        for status in (403, 429, 500, 200):
+            with self.subTest(status=status), self.assertRaises(app.HTTPException) as caught:
+                await self.load([(status, {'error': {'code': 190, 'error_subcode': 463, 'message': 'Permission denied SECRET https://graph.facebook.com/path?access_token=OTHER access_token=OTHER'}})])
+            body = json.loads(caught.exception.detail)
+            diagnostic = body['diagnosis']
+            self.assertEqual(diagnostic['upstream_status'], status)
+            self.assertEqual(diagnostic['meta_code'], 190)
+            self.assertEqual(diagnostic['meta_subcode'], 463)
+            self.assertIn('Permission denied', body['detail'])
+            for secret in ('SECRET', 'OTHER', 'graph.facebook.com', 'https://'):
+                self.assertNotIn(secret, str(body))
+            self.assertEqual(body['summary']['stop_reason'], 'graph_error' if status == 200 else 'meta_http_error')
+
+    async def test_timeout_connection_and_invalid_diagnostics(self):
+        for payload, reason in [(httpx.ReadTimeout('SECRET'), 'timeout'), (httpx.ConnectError('SECRET'), 'connection_error'), (b'invalid', 'invalid_response'), ((200, {'data': [], 'paging': {'next': 'http://bad/SECRET'}}), 'invalid_pagination')]:
+            with self.subTest(reason=reason), self.assertRaises(app.HTTPException) as caught:
+                await self.load([payload])
+            body = json.loads(caught.exception.detail)
+            self.assertEqual(body['summary']['stop_reason'], reason)
+            self.assertEqual(body['diagnosis']['kind'], reason)
+            self.assertNotIn('SECRET', str(body))
+
+    async def test_http_error_without_graph_error_retains_status(self):
+        for status in (403, 429, 500):
+            with self.subTest(status=status), self.assertRaises(app.HTTPException) as caught:
+                await self.load([(status, {})])
+            body = json.loads(caught.exception.detail)
+            self.assertEqual(body['diagnosis']['upstream_status'], status)
+            self.assertEqual(body['diagnosis']['kind'], 'meta_http_error')
+            self.assertIsNone(body['diagnosis']['meta_code'])
+
+    async def test_encoded_tokens_and_urls_are_redacted(self):
+        message = 'Permission denied %53%45%43%52%45%54 https%3A%2F%2Fgraph.facebook.com%2Fp%3Faccess_token%3DOTHER "access_token": "PRIVATE"'
+        with self.assertRaises(app.HTTPException) as caught:
+            await self.load([(403, {'error': {'message': message}})])
+        body = json.loads(caught.exception.detail)
+        self.assertIn('Permission denied', body['detail'])
+        for secret in ('SECRET', 'OTHER', 'PRIVATE', '%53', 'graph.facebook.com'):
+            self.assertNotIn(secret, str(body))
 
     async def test_normal_pagination(self):
         result, calls = await self.load([(200, {'data': [{'id': '1'}], 'paging': {'next': app.BASE_URL+'/p/posts?after=a'}}), (200, {'data': [{'id': '2'}]})])
@@ -67,6 +140,8 @@ class PostsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['posts'], [{'id': '1'}])
         self.assertTrue(result['partial'])
         self.assertNotIn('SECRET', str(result))
+        self.assertEqual(result['diagnosis']['upstream_status'], 500)
+        self.assertEqual(result['summary']['stop_reason'], 'meta_http_error')
 
     async def test_empty_next_dedup_limit_and_params(self):
         nxt = app.BASE_URL+'/p/posts?after=a'
@@ -87,6 +162,7 @@ class PostsTests(unittest.IsolatedAsyncioTestCase):
         result, calls = await self.load([(200, {'data': [{'id': '1'}], 'paging': {'next': app.BASE_URL+'/p/posts?after=a'}}), (200, {'data': [], 'paging': {'next': app.BASE_URL+'/p/posts?after=a&x=2'}})])
         self.assertTrue(result['partial'])
         self.assertEqual(len(calls), 2)
+        self.assertEqual(result['diagnosis']['kind'], 'repeated_pagination')
 
     async def test_validation(self):
         for kwargs in ({'limit': 0}, {'limit': 5001}, {'since': '2026-02-30'}, {'since': '2026-2-01'}, {'since': '2026-02-01', 'until': '2026-01-01'}):

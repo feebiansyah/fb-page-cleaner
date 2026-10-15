@@ -5,9 +5,12 @@ Jalankan di mesin kamu sendiri.
 """
 
 import asyncio
+import re
+import secrets
 import time
 from typing import List, Dict, Any, Optional
 from datetime import datetime
+from urllib.parse import unquote
 
 import httpx
 from fastapi import FastAPI, Request, Form, HTTPException
@@ -68,7 +71,9 @@ async def login(token: str = Form(...)):
                 data = r.json()
                 pages.extend(data.get("data", []))
 
-            session_id = f"sess_{int(time.time())}"
+            session_id = secrets.token_urlsafe(32)
+            while session_id in SESSIONS:
+                session_id = secrets.token_urlsafe(32)
             SESSIONS[session_id] = {
                 "user_token": token,
                 "pages": pages,
@@ -89,6 +94,21 @@ async def login(token: str = Form(...)):
             }
         except httpx.HTTPError as e:
             raise HTTPException(500, f"Network error: {str(e)}")
+
+
+def sanitize_posts_error(message, tokens):
+    """Keep useful Meta text without credentials, URLs or control characters."""
+    if not isinstance(message, str):
+        return None
+    for _ in range(3):
+        message = unquote(message)
+    for token in sorted((t for t in tokens if isinstance(t, str) and t), key=len, reverse=True):
+        message = message.replace(token, "[redacted]")
+    message = re.sub(r"(?i)(?:https?://|www\.|graph\.facebook\.com)[^\s<>\"']+", "[URL disembunyikan]", message)
+    message = re.sub(r"(?i)(?:access_token|appsecret_proof|token)[\"']?\s*[=:]\s*[\"']?[^\s,;]+|bearer\s+[^\s,;]+", "[kredensial disembunyikan]", message)
+    message = "".join(c if c.isprintable() else " " for c in message)
+    message = " ".join(message.split())
+    return message[:500] or None
 
 
 @app.get("/api/posts/{session_id}/{page_id}")
@@ -132,6 +152,8 @@ async def get_posts(
     posts, seen, visited, cursors = [], set(), set(), set()
     requests = pages = received = 0
     reason, failure = "no_next", None
+    upstream_status = meta_code = meta_subcode = None
+    tokens = [sess.get("user_token")] + [p.get("access_token") for p in sess["pages"]]
     # A finite request budget also covers empty pages and duplicate-only pages.
     # Allow normal 100-item batches plus headroom for empty/duplicate pages.
     budget = max(20, 2 * ((limit + 99) // 100))
@@ -150,21 +172,29 @@ async def get_posts(
             if cursor:
                 cursors.add(cursor)
             requests += 1
+            upstream_status = meta_code = meta_subcode = None
             try:
                 r = await client.get(url, params=params if requests == 1 else None)
-                if not r.is_success:
-                    raise HTTPException(502, f"Meta API HTTP {r.status_code}")
+                upstream_status = r.status_code
                 try:
                     data = r.json()
                 except ValueError:
-                    raise HTTPException(502, "Respons Meta bukan JSON valid")
+                    data = None
+                error = data.get("error") if isinstance(data, dict) else None
+                if not r.is_success or (isinstance(data, dict) and "error" in data):
+                    reason = "meta_http_error" if not r.is_success else "graph_error"
+                    message = None
+                    if isinstance(error, dict):
+                        meta_code = error.get("code") if type(error.get("code")) is int else None
+                        meta_subcode = error.get("error_subcode") if type(error.get("error_subcode")) is int else None
+                        message = sanitize_posts_error(error.get("message"), tokens)
+                    detail = f"Meta API HTTP {r.status_code}" if not r.is_success else "Meta Graph menolak pemuatan"
+                    if message:
+                        detail += ": " + message
+                    raise HTTPException(502, detail)
+                reason = "invalid_response"
                 if not isinstance(data, dict):
-                    raise HTTPException(502, "Struktur respons Meta tidak valid")
-                if "error" in data:
-                    error = data["error"]
-                    code = error.get("code") if isinstance(error, dict) else None
-                    suffix = f" (kode {code})" if isinstance(code, int) else ""
-                    raise HTTPException(502, "Meta API menolak pemuatan" + suffix)
+                    raise HTTPException(502, "Respons Meta bukan objek JSON valid")
                 items = data.get("data")
                 if not isinstance(items, list) or any(not isinstance(p, dict) or not isinstance(p.get("id"), str) or not p["id"] for p in items):
                     raise HTTPException(502, "Data postingan Meta tidak valid")
@@ -177,6 +207,7 @@ async def get_posts(
                 if len(posts) >= limit:
                     reason = "limit_reached"
                     break
+                reason = "invalid_pagination"
                 paging = data.get("paging", {})
                 if not isinstance(paging, dict):
                     raise HTTPException(502, "Struktur pagination Meta tidak valid")
@@ -192,17 +223,24 @@ async def get_posts(
                     raise HTTPException(502, "Pagination Meta tidak valid")
                 if url.scheme != "https" or url.host != "graph.facebook.com" or url.userinfo or url.port not in (None, 443):
                     raise HTTPException(502, "Tujuan pagination Meta tidak valid")
+            except httpx.TimeoutException:
+                reason, failure = "timeout", "Timeout saat menunggu Meta API"
+                break
             except httpx.HTTPError:
-                reason, failure = "network_error", "Koneksi ke Meta gagal atau timeout"
+                reason, failure = "connection_error", "Koneksi ke Meta gagal"
                 break
             except HTTPException as exc:
-                reason, failure = "invalid_response", exc.detail
+                failure = exc.detail
                 break
 
     summary = {"requests": requests, "pages": pages, "items_received": received, "stop_reason": reason}
+    diagnosis = None
+    if failure:
+        diagnosis = {"kind": reason, "upstream_status": upstream_status,
+                     "meta_code": meta_code, "meta_subcode": meta_subcode, "message": failure}
     if failure and not posts:
-        return JSONResponse(status_code=502, content={"detail": failure, "summary": summary})
-    return {"posts": posts, "count": len(posts), "partial": bool(failure), "warning": failure, "summary": summary}
+        return JSONResponse(status_code=502, content={"detail": failure, "diagnosis": diagnosis, "summary": summary})
+    return {"posts": posts, "count": len(posts), "partial": bool(failure), "warning": failure, "diagnosis": diagnosis, "summary": summary}
 
 
 DELETE_JOBS: Dict[str, Dict[str, Any]] = {}
