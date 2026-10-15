@@ -35,7 +35,7 @@
           <span class="text-sm self-center">maks post per page</span>
           <input type="date" id="since" class="border rounded px-2 py-1">
           <span class="text-sm self-center">sejak</span>
-          <button onclick="loadSelectedPages()" class="bg-green-600 text-white px-4 py-1 rounded">Load Posts</button>
+          <button id="load-posts" onclick="loadSelectedPages()" class="bg-green-600 text-white px-4 py-1 rounded">Load Posts</button>
           <button onclick="checkAdsPosts()" class="bg-orange-500 text-white px-4 py-1 rounded text-sm">Cek Postingan Ads</button>
           <span id="ads-status" class="text-xs text-gray-600"></span>
         </div>
@@ -165,39 +165,71 @@ function renderPages(pages) {
   `).join('');
 }
 
+let activePostsLoad = null;
+function cancelPostsLoad() {
+  if (activePostsLoad) {
+    activePostsLoad.controller.abort();
+    activePostsLoad = null;
+    document.getElementById('load-posts').disabled = false;
+  }
+}
+// Cancel at logout intent, before its asynchronous request finishes.
+document.addEventListener('click', e => {
+  if (e.target.closest('[onclick="logout()"]')) cancelPostsLoad();
+}, true);
+window.addEventListener('pagehide', cancelPostsLoad);
 async function loadSelectedPages() {
-  const checks = document.querySelectorAll('.page-check:checked');
-  if (!checks.length) return alert('Pilih minimal 1 page');
+  if (activePostsLoad && activePostsLoad.session === sessionId) return;
+  cancelPostsLoad();
+  const pages = Array.from(document.querySelectorAll('.page-check:checked'), cb => ({id: cb.value, name: cb.dataset.name}));
+  if (!sessionId) return alert('Login dulu');
+  if (!pages.length) return alert('Pilih minimal 1 page');
   const limit = document.getElementById('post-limit').value;
   const since = document.getElementById('since').value;
+  const load = {session: sessionId, controller: new AbortController()};
+  activePostsLoad = load;
+  const current = () => activePostsLoad === load && sessionId === load.session && !load.controller.signal.aborted;
+  const button = document.getElementById('load-posts');
   const postsEl = document.getElementById('posts');
-  postsEl.innerHTML = '<div class="text-gray-500">Loading posts...</div>';
+  button.disabled = true;
+  postsEl.textContent = 'Loading posts...';
   document.getElementById('posts-area').classList.remove('hidden');
   selectedPosts.clear();
-
-  let allPosts = [];
-  const seenIds = new Set();
-  for (const cb of checks) {
-    const pageId = cb.value;
-    const pageName = cb.dataset.name;
-    const url = `/api/posts/${sessionId}/${pageId}?limit=${limit}${since ? '&since='+since : ''}`;
-    const res = await fetch(url);
-    const data = await res.json();
-    if (!res.ok) {
-      postsEl.innerHTML += `<div class="text-red-600">Error page ${pageName}: ${data.detail}</div>`;
-      continue;
+  const allPosts = [], messages = [], seenIds = new Set();
+  let validEmpty = 0;
+  try {
+    for (const page of pages) {
+      if (!current()) return;
+      try {
+        const query = new URLSearchParams({limit});
+        if (since) query.set('since', since);
+        let res;
+        try {
+          res = await fetch(`/api/posts/${encodeURIComponent(load.session)}/${encodeURIComponent(page.id)}?${query}`, {signal: load.controller.signal});
+        } catch {
+          throw new Error('Koneksi gagal atau pemuatan dibatalkan');
+        }
+        if (!current()) return;
+        let data;
+        try { data = await res.json(); }
+        catch { throw new Error(`Respons bukan JSON valid (HTTP ${res.status})`); }
+        if (!current()) return;
+        if (!res.ok) throw new Error(`HTTP ${res.status}: pemuatan ditolak atau gagal`);
+        if (!data || !Array.isArray(data.posts) || data.posts.some(p => !p || typeof p.id !== 'string' || !p.id)) throw new Error('Struktur respons postingan tidak valid');
+        if (data.partial) messages.push(`${page.name}: Hasil parsial. ${data.warning || 'Pemuatan berhenti sebelum selesai'}`);
+        else if (!data.posts.length) validEmpty++;
+        for (const p of data.posts) {
+          if (seenIds.has(p.id)) continue;
+          seenIds.add(p.id);
+          allPosts.push({...p, _pageName: page.name, _pageId: page.id});
+        }
+      } catch (error) {
+        if (!current()) return;
+        const reason = error instanceof TypeError ? 'Koneksi gagal' : error.message;
+        messages.push(`${page.name}: Gagal memuat. ${reason}`);
+      }
     }
-    data.posts.forEach(p => {
-      if (seenIds.has(p.id)) return;  // skip duplikat
-      seenIds.add(p.id);
-      p._pageName = pageName;
-      p._pageId = pageId;
-      allPosts.push(p);
-    });
-  }
-
-  console.log('Loaded unique posts:', allPosts.length);
-
+    if (!current()) return;
   postsEl.innerHTML = allPosts.map(p => {
     let thumb = '';
     let mediaLabel = '';
@@ -232,7 +264,23 @@ async function loadSelectedPages() {
         </div>
       </label>
     `;
-  }).join('') || '<div class="text-gray-500">Tidak ada postingan</div>';
+  }).join('');
+    if (validEmpty) postsEl.innerHTML += `<div class="text-gray-500">Tidak ada postingan pada ${validEmpty} Fanpage dengan respons valid.</div>`;
+    if (since) messages.unshift(`Hasil mengikuti filter tanggal sejak ${since}.`);
+    for (const message of messages) {
+      const el = document.createElement('div');
+      el.className = 'text-red-600';
+      el.textContent = message;
+      postsEl.appendChild(el);
+    }
+  } catch {
+    if (current()) postsEl.textContent = 'Gagal memuat: hasil tidak dapat ditampilkan.';
+  } finally {
+    if (activePostsLoad === load) {
+      activePostsLoad = null;
+      button.disabled = false;
+    }
+  }
 }
 
 function selectAll() {

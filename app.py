@@ -107,6 +107,18 @@ async def get_posts(
     if not page or not page.get("access_token"):
         raise HTTPException(400, "Page token tidak ditemukan")
 
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1 or limit > 200:
+        raise HTTPException(422, "Limit harus antara 1 dan 200")
+    for value in (since, until):
+        if value is not None:
+            try:
+                if datetime.strptime(value, "%Y-%m-%d").strftime("%Y-%m-%d") != value:
+                    raise ValueError()
+            except ValueError:
+                raise HTTPException(422, "Tanggal harus valid dalam format YYYY-MM-DD")
+    if since and until and since > until:
+        raise HTTPException(422, "Tanggal sejak melebihi tanggal akhir")
+
     params = {
         "fields": "id,message,created_time,permalink_url,status_type,full_picture,attachments{media,type,title,description,url}",
         "limit": min(limit, 100),
@@ -117,23 +129,79 @@ async def get_posts(
     if until:
         params["until"] = until
 
-    posts = []
-    seen = set()
+    posts, seen, visited, cursors = [], set(), set(), set()
+    requests = pages = received = 0
+    reason, failure = "no_next", None
+    # A finite request budget also covers empty pages and duplicate-only pages.
+    budget = 20
+    url = httpx.URL(f"{BASE_URL}/{page_id}/posts")
     async with httpx.AsyncClient(timeout=30.0) as client:
-        url = f"{BASE_URL}/{page_id}/posts"
         while url and len(posts) < limit:
-            r = await client.get(url, params=params if url.endswith("/posts") else None)
-            data = r.json()
-            if "error" in data:
-                raise HTTPException(400, data["error"].get("message"))
-            for p in data.get("data", []):
-                if p.get("id") and p["id"] not in seen and len(posts) < limit:
-                    seen.add(p["id"])
-                    posts.append(p)
-            url = data.get("paging", {}).get("next")
-            params = None
+            key = str(url.copy_with(params=sorted(url.params.multi_items())))
+            cursor = url.params.get("after")
+            if key in visited or (cursor and cursor in cursors):
+                reason, failure = "repeated_pagination", "Pagination berulang; pemuatan dihentikan"
+                break
+            if requests >= budget:
+                reason, failure = "request_budget", "Batas request pemuatan tercapai"
+                break
+            visited.add(key)
+            if cursor:
+                cursors.add(cursor)
+            requests += 1
+            try:
+                r = await client.get(url, params=params if requests == 1 else None)
+                if not r.is_success:
+                    raise HTTPException(502, f"Meta API HTTP {r.status_code}")
+                try:
+                    data = r.json()
+                except ValueError:
+                    raise HTTPException(502, "Respons Meta bukan JSON valid")
+                if not isinstance(data, dict):
+                    raise HTTPException(502, "Struktur respons Meta tidak valid")
+                if "error" in data:
+                    error = data["error"]
+                    code = error.get("code") if isinstance(error, dict) else None
+                    suffix = f" (kode {code})" if isinstance(code, int) else ""
+                    raise HTTPException(502, "Meta API menolak pemuatan" + suffix)
+                items = data.get("data")
+                if not isinstance(items, list) or any(not isinstance(p, dict) or not isinstance(p.get("id"), str) or not p["id"] for p in items):
+                    raise HTTPException(502, "Data postingan Meta tidak valid")
+                pages += 1
+                received += len(items)
+                for post in items:
+                    if post["id"] not in seen and len(posts) < limit:
+                        seen.add(post["id"])
+                        posts.append(post)
+                if len(posts) >= limit:
+                    reason = "limit_reached"
+                    break
+                paging = data.get("paging", {})
+                if not isinstance(paging, dict):
+                    raise HTTPException(502, "Struktur pagination Meta tidak valid")
+                nxt = paging.get("next")
+                if nxt is None:
+                    reason = "no_next"
+                    break
+                if not isinstance(nxt, str) or not nxt:
+                    raise HTTPException(502, "Pagination Meta tidak valid")
+                try:
+                    url = httpx.URL(nxt)
+                except httpx.InvalidURL:
+                    raise HTTPException(502, "Pagination Meta tidak valid")
+                if url.scheme != "https" or url.host != "graph.facebook.com" or url.userinfo or url.port not in (None, 443):
+                    raise HTTPException(502, "Tujuan pagination Meta tidak valid")
+            except httpx.HTTPError:
+                reason, failure = "network_error", "Koneksi ke Meta gagal atau timeout"
+                break
+            except HTTPException as exc:
+                reason, failure = "invalid_response", exc.detail
+                break
 
-    return {"posts": posts, "count": len(posts)}
+    summary = {"requests": requests, "pages": pages, "items_received": received, "stop_reason": reason}
+    if failure and not posts:
+        return JSONResponse(status_code=502, content={"detail": failure, "summary": summary})
+    return {"posts": posts, "count": len(posts), "partial": bool(failure), "warning": failure, "summary": summary}
 
 
 DELETE_JOBS: Dict[str, Dict[str, Any]] = {}
